@@ -56,6 +56,9 @@ pub(crate) struct Staging {
     uploaded: std::sync::atomic::AtomicBool,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
+    /// Whether the staging buffer holds anything of the texture's yet (a
+    /// whole detiling, or zeros: [`Staging::refresh`]).
+    filled: std::sync::atomic::AtomicBool,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -650,6 +653,22 @@ impl Staging {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
         let read = self.refresh_now();
+        // Nothing detiled into it yet (the memory could not be read while
+        // the runtime remapped it, or read all zeros): it would upload what
+        // its memory held before, and a staging buffer in a list's scratch
+        // memory holds another texture's texels (blocks of other colours on
+        // the textures made while title memory was being remapped). Zeros
+        // then, as a fresh upload buffer holds.
+        if !self.filled.load(Relaxed) {
+            // Under `last`'s lock, as every write of the mapping (another
+            // submission's refresh may be detiling into it).
+            let _last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+            if !self.filled.swap(true, Relaxed) {
+                // SAFETY: the subresources' parts of the mapped staging
+                // buffer, which only refreshes write, under this lock.
+                unsafe { zero_footprints(self.data, &self.footprints, &self.rows) };
+            }
+        }
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
@@ -845,6 +864,23 @@ impl Staging {
                 return;
             }
         }
+        self.filled.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Zeros the parts of a staging buffer mapped at `data` that subresources
+/// with these footprints and row counts take.
+///
+/// # Safety
+/// Each footprint's part (from its offset, its row pitch times its rows
+/// times its depth) lies in the mapping at `data`, which nothing else
+/// accesses meanwhile.
+unsafe fn zero_footprints(data: *mut u8, footprints: &[D3D12_PLACED_SUBRESOURCE_FOOTPRINT], rows: &[u32]) {
+    for (footprint, &rows) in footprints.iter().zip(rows) {
+        let f = footprint.Footprint;
+        let len = f.RowPitch as usize * rows as usize * f.Depth as usize;
+        // SAFETY: the caller's.
+        unsafe { std::ptr::write_bytes(data.add(footprint.Offset as usize), 0, len) };
     }
 }
 
@@ -1120,7 +1156,38 @@ fn new_staging(resource: This, texture: &ID3D12Resource, list: Option<&HostList>
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
+        filled: std::sync::atomic::AtomicBool::new(false),
     })
+}
+
+#[cfg(test)]
+mod staging_tests {
+    use windows::Win32::Graphics::Direct3D12::{D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_SUBRESOURCE_FOOTPRINT};
+
+    /// A staging buffer's subresources are zeroed where they lie (after the
+    /// place the list's scratch memory gave, their offsets), and nothing
+    /// around them: the scratch memory before and after is other uploads'.
+    #[test]
+    fn zeroing_takes_the_subresources_parts_alone() {
+        let at = |offset: u64, pitch: u32, depth: u32| D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            Offset: offset,
+            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                RowPitch: pitch,
+                Depth: depth,
+                ..Default::default()
+            },
+        };
+        // Two subresources placed at 512 in the chunk: 256 x 2 rows, then
+        // 256 x 1 row x 2 deep.
+        let footprints = [at(512, 256, 1), at(1024, 256, 2)];
+        let rows = [2, 1];
+        let mut chunk = vec![0xAAu8; 2048];
+        // SAFETY: both parts lie in `chunk`, borrowed by nothing else.
+        unsafe { super::zero_footprints(chunk.as_mut_ptr(), &footprints, &rows) };
+        assert!(chunk[..512].iter().all(|&b| b == 0xAA));
+        assert!(chunk[512..1536].iter().all(|&b| b == 0));
+        assert!(chunk[1536..].iter().all(|&b| b == 0xAA));
+    }
 }
 
 #[cfg(test)]
