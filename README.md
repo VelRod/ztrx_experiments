@@ -42,10 +42,14 @@ powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Game "<your game fold
 (a DualShock/DualSense through DS4Windows works). With no pad connected the
 keyboard acts as one while the game window has focus.
 
-## Faster settings (optional, off by default)
+## Faster settings (on by default)
 
-`VICTORY_RELAY=2`, or `VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1` cut frame
-time on the test machines. Set them in PowerShell before running the script.
+`scripts\play.ps1` sets `VICTORY_RELAY=2 VICTORY_WIDE_BACK=1
+VICTORY_CARD_REHASH_RUNS=1 VICTORY_INDIRECT_WINDOW=1 VICTORY_TEXTURE_NO_WAIT=1
+VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_CARD_BUFFERS_MB=1024`. On an NVIDIA
+RTX 5070 the prologue ran at 2.1 fps without them and 5.9 fps with them.
+A value you set in PowerShell before running the script wins; `-Plain` runs
+without them.
 
 ## Debugging switches
 
