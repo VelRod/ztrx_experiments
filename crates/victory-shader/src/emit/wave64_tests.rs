@@ -450,3 +450,62 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
 }
+
+/// `WaveActiveSum` of a double over a console wave of 64 ([`super::wave::DOUBLE_SUM_V7_TO_S12`]),
+/// rounded to a float (`v_cvt_f32_f64`): thread t sums 2^(t & 3), 240 in all. On a host of
+/// 32-lane waves the two halves add their sums.
+#[test]
+fn a_sum_of_doubles_over_the_wave_rounded_to_a_float() {
+    let mut words = vec![
+        0xBE94_0304, // s_mov_b32 s20, s4 (the table, for after the section)
+        0x360C_0083, // v_and_b32 v6, 3, v0
+        0x340C_0C94, // v_lshlrev_b32 v6, 20, v6
+        0x4A10_0CFF,
+        0x3FF0_0000, // v_add_nc_u32 v8, 0x3ff00000, v6 (the high dword of 2^(t & 3))
+        0x7E0E_0280, // v_mov_b32 v7, 0
+    ];
+    words.extend_from_slice(&super::wave::DOUBLE_SUM_V7_TO_S12);
+    words.extend_from_slice(&super::wave::DOUBLE_SUM_END);
+    words.extend_from_slice(&[
+        0xBE95_0380, // s_mov_b32 s21, 0
+        0x3D << 26 | 0x02 << 18 | 8 << 6 | 10,
+        125 << 25,   // s_load_dwordx4 s[8:11], s[20:21], 0
+        0x7E00_1E0C, // v_cvt_f32_f64 v0, s[12:13]
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    ]);
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let (root, pso) = match host.compute_pipeline(&shader) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("the hardware device does not take this program: {e}; not run");
+            return;
+        }
+    };
+    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(1)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    assert_eq!(f32::from_bits(out[0][0]), 240.0);
+    eprintln!("ran on the hardware device: the wave's sum of doubles, 240");
+}

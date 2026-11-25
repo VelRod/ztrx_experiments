@@ -1820,6 +1820,12 @@ impl<'a> Lower<'a> {
             .get(&mask)
             .ok_or("a wave reduction's untracked mask")?;
         let on = self.boolean(m, c)?;
+        if let Op::AddD { high, pair } = op {
+            return match prefix {
+                Some(_) => Err("a wave prefix of an operation other than a sum"),
+                None => self.double_sum(on, src, pair, high),
+            };
+        }
         let x = self.i32_of(src)?;
         let id = self.s.m.i32(ident);
         let x = self.s.m.select(c, on, x, id);
@@ -3545,6 +3551,48 @@ impl<'a> Lower<'a> {
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
         self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
+
+    /// One dword (`high`) of a wave's sum of doubles ([`super::wave::Op::AddD`]): the lanes'
+    /// pairs (`src` this dword's value, `pair` the other's) where `on`, 0.0 elsewhere. On
+    /// host waves of 32 the two halves of a console wave add their sums.
+    fn double_sum(&mut self, on: V, src: Value, pair: Value, high: bool) -> Result<V, Why> {
+        let c = self.cur;
+        let (lo, hi) = if high { (pair, src) } else { (src, pair) };
+        let (lo, hi) = (self.i32_of(lo)?, self.i32_of(hi)?);
+        let z = self.s.m.i32(0);
+        let lo = self.s.m.select(c, on, lo, z);
+        let hi = self.s.m.select(c, on, hi, z);
+        self.s.flags |= flags::WAVE_OPS | flags::DOUBLES;
+        let f64t = self.s.m.double();
+        let i32t = self.s.t.i32;
+        let d = self.s.op(c, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[lo, hi]);
+        let (k0, k0u) = (self.s.m.i8(0), self.s.m.i8(0));
+        let r = self.s.op(c, "waveActiveOp.f64", Attr::NoUnwind, f64t, 119, &[d, k0, k0u]);
+        let split = self.s.m.named_struct("dx.types.splitdouble", vec![i32t, i32t]);
+        let words = |l: &mut Self, d: V| {
+            let c = l.cur;
+            let s = l.s.op(c, "splitDouble.f64", Attr::ReadNone, split, 102, &[d]);
+            (l.s.m.extract(c, s, 0), l.s.m.extract(c, s, 1))
+        };
+        // as `shape` combines the halves' results of the other operations
+        let r = if self.local || self.exchange.as_ref().is_some_and(|e| e.1) || self.exchange.is_none() {
+            r
+        } else {
+            if !self.all_lanes(self.cur_ir) {
+                need(self.cur_ir);
+                return Err("a wave reduction where not every lane runs");
+            }
+            let (rl, rh) = words(self, r);
+            let (l0, l1) = self.exchange_halves(self.cur, rl);
+            let (h0, h1) = self.exchange_halves(self.cur, rh);
+            let c = self.cur;
+            let a = self.s.op(c, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[l0, h0]);
+            let b = self.s.op(c, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[l1, h1]);
+            self.s.m.bin(c, Bin::Add, a, b)
+        };
+        let (rl, rh) = words(self, r);
+        Ok(if high { rh } else { rl })
     }
 
     /// `exchange`: each host wave gives `mine` (the same in all its lanes) for its half; both get
@@ -7118,6 +7166,33 @@ impl<'a> Lower<'a> {
                 let x = self.s.m.bin(c, Bin::Or, old, h);
                 self.write(inst, Reg::V(reg), x, guard);
                 Ok(())
+            }
+            "v_cvt_f32_f64" => {
+                // The pair's dwords as a double, rounded to a float.
+                if v.abs != 0 || v.neg != 0 || v.sdwa.is_some() || v.dpp.is_some() {
+                    return Err("64-bit operand modifiers");
+                }
+                let read = |l: &mut Self, r: Reg| -> Result<V, Why> {
+                    l.i32_of(inst.read(r).ok_or("an unread operand")?)
+                };
+                let (lo, hi) = match *v.src.first().ok_or("a missing operand")? {
+                    Operand::Vector { reg, .. } => {
+                        (read(self, Reg::V(reg))?, read(self, Reg::V(reg + 1))?)
+                    }
+                    Operand::Scalar { code, .. } if code != NULL => {
+                        (read(self, Reg::S(code))?, read(self, Reg::S(code + 1))?)
+                    }
+                    Operand::Const(128) => (self.s.m.i32(0), self.s.m.i32(0)),
+                    // a 64-bit float operand's literal is its high dword
+                    Operand::Literal(x) => (self.s.m.i32(0), self.s.m.i32(x)),
+                    _ => return Err("a 64-bit constant operand"),
+                };
+                self.s.flags |= flags::DOUBLES;
+                let f64t = self.s.m.double();
+                let d = self.s.op(c, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[lo, hi]);
+                let f32t = self.s.t.f32;
+                let r = self.s.m.cast(c, Cast::FpTrunc, d, f32t);
+                float(self, r)
             }
             "v_cvt_pkrtz_f16_f32" => {
                 let (a, bb) = (f(self, 0)?, f(self, 1)?);
