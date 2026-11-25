@@ -52,6 +52,14 @@ static const uint GROUPS = 1u << 20;
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
+    if (kind == 0xFFFFFFFFu) {
+        // The list's budget and its statistics, zeroed before its first
+        // clamp (a budget in the card's memory, which the CPU cannot zero).
+        if (id.x == 0) {
+            budget.Store3(0, uint3(0, 0, 0));
+        }
+        return;
+    }
     uint eff_count = records;
     bool ahead = (has_count & 2u) != 0;
     if ((has_count & 1u) != 0) {
@@ -242,6 +250,9 @@ fn validate_layout(
 /// `kind` (PC argument numbering) `stride` bytes apart from `src` (and bounded
 /// by the 32-bit count in `count` when given) into a device-local scratch
 /// buffer, leaving that scratch buffer in `INDIRECT_ARGUMENT` at offset `0`.
+/// It stays there for the indirect executions that read it, with no barrier
+/// after each; the next clamp moves it from there, and the list's close
+/// brings it back to the common state (`HostList::indirect_scratch`).
 /// Replaces the list's compute root signature and pipeline (callers bind
 /// theirs after). `None` if the clamp or alignment is not available.
 pub(crate) fn bound(
@@ -250,9 +261,7 @@ pub(crate) fn bound(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
-    let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
+    bound_in(list, src, count, spec, false)
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -270,11 +279,55 @@ pub(crate) fn bound_ahead(
     src: (&ID3D12Resource, u64),
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
-    let bytes = validate_layout(spec, src.1, None)?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true).then_some(dst)
+    bound_in(list, src, None, spec, true)
 }
 
+/// Records into `l` the zeroing of a list's budget words at `budget` (in
+/// the card's memory, `HostList::budget`): a dispatch of the clamp's own
+/// shader that stores zeros there. The first clamp after it begins with a
+/// wait for every earlier shader write, so it finds them zeroed. Replaces
+/// the list's compute root signature and pipeline, as a clamp does.
+/// (`VICTORY_BARRIER_TEST=indirect` leaves that wait out: the zeros may then
+/// land after the first clamp's charge.)
+pub(crate) fn zero_budget(l: &ID3D12GraphicsCommandList, budget: u64) -> bool {
+    let Some(c) = clamp() else {
+        return false;
+    };
+    let constants = [u32::MAX, 0, 0, 0, 0, 0];
+    // SAFETY: an open list; our root signature and pipeline; every root
+    // view names the budget words, the only memory this mode touches.
+    unsafe {
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+        l.SetComputeRootShaderResourceView(1, budget);
+        l.SetComputeRootShaderResourceView(2, budget);
+        l.SetComputeRootUnorderedAccessView(3, budget);
+        l.SetComputeRootUnorderedAccessView(4, budget);
+        l.Dispatch(1, 1, 1);
+    }
+    true
+}
+
+/// [`bound`] and [`bound_ahead`]: the clamp into the list's scratch buffer,
+/// from the state the list has left it in.
+fn bound_in(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    ahead: bool,
+) -> Option<ID3D12Resource> {
+    let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
+    let (c, budget, (dst, from)) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    if !record_clamp_as(c, &list.list, &dst, budget, src, count, spec, ahead, from) {
+        return None;
+    }
+    list.indirect_scratch_holds_arguments();
+    Some(dst)
+}
+
+#[cfg(test)]
 fn record_clamp(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
@@ -284,11 +337,13 @@ fn record_clamp(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> bool {
-    record_clamp_as(c, l, dst, budget, src, count, spec, false)
+    record_clamp_as(c, l, dst, budget, src, count, spec, false, D3D12_RESOURCE_STATE_COMMON)
 }
 
 /// [`record_clamp`]; `ahead`: the records are a window clamped ahead of
-/// their draws ([`bound_ahead`]).
+/// their draws ([`bound_ahead`]); `from`: the state `dst` is in (common,
+/// or indirect arguments from an earlier clamp of the same list). Records
+/// nothing when it returns false.
 #[allow(clippy::too_many_arguments)]
 fn record_clamp_as(
     c: &Clamp,
@@ -299,6 +354,7 @@ fn record_clamp_as(
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
+    from: D3D12_RESOURCE_STATES,
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -347,7 +403,7 @@ fn record_clamp_as(
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
-    // transitions `COMMON -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`.
+    // transitions `from -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`.
     // Diagnostics: counted; `VICTORY_BARRIER_TEST=indirect` leaves the two
     // waits for every earlier shader write out (the state changes stay).
     #[cfg(feature = "diagnostics")]
@@ -358,11 +414,7 @@ fn record_clamp_as(
     let waits = true;
     let first = [
         uav_barrier(),
-        transition(
-            dst,
-            D3D12_RESOURCE_STATE_COMMON,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        ),
+        transition(dst, from, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
     ];
     let second = [
         uav_barrier(),
@@ -391,12 +443,10 @@ fn record_clamp_as(
     true
 }
 
-/// After indirect execution (or if preparation failed after [`bound`]):
-/// returns the scratch buffer to the common state for the next call.
-pub(crate) fn done(list: &HostList, scratch: &ID3D12Resource) {
-    done_on(&list.list, scratch);
-}
-
+/// Returns a scratch buffer a lone [`record_clamp`] left in
+/// `INDIRECT_ARGUMENT` to the common state (tests; host lists do this once,
+/// at their close).
+#[cfg(test)]
 fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
     // SAFETY: an open list and a live scratch buffer in INDIRECT_ARGUMENT.
     unsafe {
@@ -429,6 +479,17 @@ mod tests {
     use windows::Win32::Graphics::Dxgi::*;
     use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
     use windows::core::Interface;
+
+    /// The tests here that use a device take it one at a time: a test on
+    /// the host's card beside the software adapter's tests crashed the test
+    /// process now and then (7 of 60 runs of
+    /// `host_list_reuses_and_grows_scratch_across_submissions` with the
+    /// `warp_` tests, an access violation, before any change here).
+    static DEVICE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+        DEVICE.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     const WORKER_CS: &str = r#"
 #define RS "UAV(u0)"
@@ -616,6 +677,200 @@ void main() {
         }
     }
 
+    impl WarpHarness {
+        /// The same harness on the system's default adapter (the graphics
+        /// card), for measurements; `None` if that is the software one.
+        fn on_hardware() -> Option<Self> {
+            // SAFETY: plain D3D12 object creation on the default adapter.
+            unsafe {
+                let mut device: Option<ID3D12Device> = None;
+                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
+                let device = device?;
+                let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+                let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(device.GetAdapterLuid()).ok()?;
+                let desc = adapter.GetDesc1().ok()?;
+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                    return None;
+                }
+                eprintln!("adapter: {}", String::from_utf16_lossy(&desc.Description).trim_end_matches('\0'));
+                let queue: ID3D12CommandQueue = device
+                    .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })
+                    .ok()?;
+                let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
+                let list: ID3D12GraphicsCommandList =
+                    device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).ok()?;
+                let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+                let event = CreateEventW(None, false, false, None).ok()?;
+                let clamp = make_for(&device).ok()?;
+                let worker = compile_cs(&device, WORKER_CS).ok()?;
+                Some(Self { device, queue, allocator, list, fence, submitted: 0, event, clamp, worker })
+            }
+        }
+    }
+
+    /// A graphics pipeline that draws its triangles off the screen (no
+    /// targets, no pixel shader): a draw that costs the card next to
+    /// nothing, as the title's draws of a few meshlets do.
+    fn offscreen_draw(device: &ID3D12Device) -> (ID3D12RootSignature, ID3D12PipelineState) {
+        const VS: &str = r#"
+[RootSignature("RootFlags(0)")]
+float4 main(uint id : SV_VertexID) : SV_Position { return float4(-4.0 - id, -4.0, 0.5, 1.0); }
+"#;
+        let vs = crate::host::compile(VS, s!("main"), s!("vs_5_1")).expect("the vertex shader must compile");
+        // SAFETY: the root signature is inside the shader; the description
+        // points at live data.
+        unsafe {
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, &vs[..]).unwrap();
+            let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                VS: D3D12_SHADER_BYTECODE { pShaderBytecode: vs.as_ptr().cast(), BytecodeLength: vs.len() },
+                SampleMask: u32::MAX,
+                RasterizerState: D3D12_RASTERIZER_DESC {
+                    FillMode: D3D12_FILL_MODE_SOLID,
+                    CullMode: D3D12_CULL_MODE_NONE,
+                    DepthClipEnable: true.into(),
+                    ..Default::default()
+                },
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            let pso: ID3D12PipelineState = device.CreateGraphicsPipelineState(&desc).unwrap();
+            (root, pso)
+        }
+    }
+
+    /// What one indirect draw costs the card, in the patterns the host
+    /// lists record (a measurement, not a check: run it on the graphics
+    /// card with `cargo test -p victory-gpu --release indirect_draw_costs
+    /// -- --ignored --nocapture`). Each pattern records 2,000 indirect draws
+    /// of one record each, clamped by `record_clamp_as` every `every` draws
+    /// (a window of that many records; 0: once, for all of them), and the
+    /// card's time between a timestamp before and after them is divided by
+    /// the draws.
+    #[test]
+    #[ignore = "a measurement on the graphics card"]
+    fn indirect_draw_costs() {
+        let _device = one_at_a_time();
+        let Some(mut hw) = WarpHarness::on_hardware() else {
+            eprintln!("no graphics card: nothing measured");
+            return;
+        };
+        const N: u32 = 2000;
+        const STRIDE: u32 = 16;
+        let (root, pso) = offscreen_draw(&hw.device);
+        let sig = hw.signature(0, STRIDE);
+        // The title's records: 3 vertices, 1 instance. Clamped as mesh
+        // records (kind 10) they are 3 groups, then 1, 1 (the clamp's
+        // statistics atomics run for those), and drawn as draw records they
+        // are still 3 vertices of 1 instance (from vertex 1).
+        let (src, src_ptr, _) = hw.shared_buffer(u64::from(N * STRIDE));
+        for i in 0..N as usize {
+            // SAFETY: inside the mapped buffer.
+            unsafe { src_ptr.cast::<u32>().add(i * 4).copy_from_nonoverlapping([3u32, 1, 1, 0].as_ptr(), 4) };
+        }
+        let (_budget_pc, _, budget_pc) = hw.shared_buffer(256);
+        let budget_card_buffer = hw.default_uav(256);
+        // SAFETY: a live buffer.
+        let budget_card = unsafe { budget_card_buffer.GetGPUVirtualAddress() };
+        let scratch = hw.default_uav(u64::from(N * STRIDE));
+        let (heap, back) = {
+            let mut heap: Option<ID3D12QueryHeap> = None;
+            // SAFETY: plain query heap creation.
+            unsafe {
+                hw.device
+                    .CreateQueryHeap(&D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: 2, NodeMask: 0 }, &mut heap)
+                    .unwrap()
+            };
+            let (back, back_ptr, _) = hw.shared_buffer(16);
+            (heap.unwrap(), (back, back_ptr))
+        };
+        // SAFETY: a plain query.
+        let frequency = unsafe { hw.queue.GetTimestampFrequency() }.unwrap() as f64;
+        // (name, kind clamped, clamp every, transition after each draw (as
+        // before), budget on the card)
+        const DRAW: u32 = 0;
+        const MESH: u32 = 10;
+        let patterns: [(&str, u32, u32, bool, bool); 14] = [
+            ("draw records, clamp per draw, transition after each", DRAW, 1, true, false),
+            ("draw records, clamp per draw", DRAW, 1, false, false),
+            ("draw records, clamp per draw, budget on the card", DRAW, 1, false, true),
+            ("draw records, one clamp of all, budget on the card", DRAW, 0, false, true),
+            ("mesh records, windows of 2, transition after each", MESH, 2, true, false),
+            ("mesh records, windows of 2", MESH, 2, false, false),
+            ("mesh records, windows of 2, budget on the card", MESH, 2, false, true),
+            ("mesh records, windows of 16", MESH, 16, false, false),
+            ("mesh records, windows of 16, budget on the card", MESH, 16, false, true),
+            ("mesh records, windows of 64", MESH, 64, false, false),
+            ("mesh records, windows of 64, budget on the card", MESH, 64, false, true),
+            ("mesh records, clamp per draw", MESH, 1, false, false),
+            ("mesh records, clamp per draw, budget on the card", MESH, 1, false, true),
+            ("mesh records, one clamp of all, budget on the card", MESH, 0, false, true),
+        ];
+        for round in 0..2 {
+            for &(name, kind, every, after_each, on_card) in &patterns {
+                let l = hw.list.clone();
+                let budget = if on_card { budget_card } else { budget_pc };
+                let mut state = D3D12_RESOURCE_STATE_COMMON;
+                let mut base = 0;
+                let graphics = |l: &ID3D12GraphicsCommandList| unsafe {
+                    l.SetGraphicsRootSignature(&root);
+                    l.SetPipelineState(&pso);
+                    l.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                    l.RSSetViewports(&[D3D12_VIEWPORT { Width: 1.0, Height: 1.0, MaxDepth: 1.0, ..Default::default() }]);
+                    l.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: 1, bottom: 1 }]);
+                };
+                // SAFETY: an open list, live buffers and pipelines.
+                unsafe {
+                    graphics(&l);
+                    l.EndQuery(&heap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+                    for i in 0..N {
+                        let clamp_now = if every == 0 { i == 0 } else { i % every == 0 };
+                        if clamp_now {
+                            let records = if every == 0 { N } else { every.min(N - i) };
+                            let ok = record_clamp_as(
+                                &hw.clamp,
+                                &l,
+                                &scratch,
+                                budget,
+                                (&src, u64::from(i * STRIDE)),
+                                None,
+                                (kind, STRIDE, records),
+                                records > 1,
+                                state,
+                            );
+                            assert!(ok);
+                            state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+                            base = i;
+                            graphics(&l);
+                        }
+                        l.ExecuteIndirect(&sig, 1, &scratch, u64::from((i - base) * STRIDE), None, 0);
+                        if after_each {
+                            // As `done` did: back to common after each draw
+                            // (the next window hit reads it promoted).
+                            done_on(&l, &scratch);
+                            state = D3D12_RESOURCE_STATE_COMMON;
+                        }
+                    }
+                    l.EndQuery(&heap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                    l.ResolveQueryData(&heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &back.0, 0);
+                    if state == D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT {
+                        done_on(&l, &scratch);
+                    }
+                }
+                hw.submit_and_wait();
+                // SAFETY: the read-back buffer the list resolved into.
+                let [t0, t1] = unsafe { [back.1.cast::<u64>().read_volatile(), back.1.cast::<u64>().add(1).read_volatile()] };
+                if round == 1 {
+                    let us = (t1.saturating_sub(t0)) as f64 * 1e6 / frequency / f64::from(N);
+                    eprintln!("{us:7.2} us per draw  {name}");
+                }
+            }
+        }
+        // SAFETY: a plain query.
+        assert!(unsafe { hw.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
     fn compile_cs(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
         let mut code: Option<ID3DBlob> = None;
         // SAFETY: source and entry names outlive `D3DCompile`.
@@ -661,6 +916,7 @@ void main() {
     /// compare before it, also a change back.
     #[test]
     fn warp_card_compare_stores_the_hash_it_made_when_told() {
+        let _device = one_at_a_time();
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
@@ -723,6 +979,7 @@ void main() {
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
+        let _device = one_at_a_time();
         if super::host().is_none() {
             return; // no host GPU here
         }
@@ -759,6 +1016,7 @@ void main() {
     ///     records into `dst_args` at offset `0`.
     #[test]
     fn warp_count_buffer_ignores_garbage_tail_and_preserves_source() {
+        let _device = one_at_a_time();
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
@@ -968,6 +1226,7 @@ void main() {
     /// to the most and spend the budget.
     #[test]
     fn warp_window_leaves_unfilled_slots_empty_and_uncharged() {
+        let _device = one_at_a_time();
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
@@ -1004,6 +1263,7 @@ void main() {
                 None,
                 (KIND_MESH, STRIDE, RECORDS),
                 ahead,
+                D3D12_RESOURCE_STATE_COMMON,
             ));
             done_on(&warp.list, &dst_buf);
             // SAFETY: an open list; the scratch buffer is copied for the check.
@@ -1051,6 +1311,7 @@ void main() {
 
     #[test]
     fn warp_budget_saturates_without_wraparound_and_preserves_draw_fields() {
+        let _device = one_at_a_time();
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
@@ -1152,10 +1413,71 @@ void main() {
         assert_eq!((kept, zeroed), (2, (RECORDS as usize) - 2));
     }
 
-    /// Exercises `HostList::indirect_scratch`, `bound`, `done`, `Host::execute`,
-    /// and `HostList::reset` end-to-end on the host device.
+    /// A list's budget in the card's memory (`HostList::budget`): four draw
+    /// records that each ask for half the budget leave exactly two drawn and
+    /// two emptied, and the list zeroes the budget itself at every run (run
+    /// twice without a reset, it draws two again, not none).
+    #[test]
+    fn a_card_budget_is_charged_and_zeroed_by_each_run_of_the_list() {
+        let _device = one_at_a_time();
+        let Some(host) = super::host() else {
+            return;
+        };
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        const RECORDS: u32 = 4;
+        const STRIDE: u32 = 16;
+        let bytes = u64::from(RECORDS * STRIDE);
+        let (Some((src, src_ptr)), Some((back, back_ptr))) = (host.shared_buffer(bytes), host.shared_buffer(bytes)) else {
+            return;
+        };
+        // 2^24 vertices of 4 instances: 2^26, half the budget, each.
+        for i in 0..RECORDS as usize {
+            // SAFETY: inside the mapped buffer.
+            unsafe { src_ptr.cast::<u32>().add(i * 4).copy_from_nonoverlapping([1u32 << 24, 4, 0, 0].as_ptr(), 4) };
+        }
+        let scratch = bound(&list, (&src, 0), None, (0, STRIDE, RECORDS)).unwrap();
+        // SAFETY: an open list; the scratch buffer holds arguments and is
+        // put back in that state after the copy.
+        unsafe {
+            list.list.ResourceBarrier(&[transition(
+                &scratch,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            list.list.CopyBufferRegion(&back, 0, &scratch, 0, bytes);
+            list.list.ResourceBarrier(&[transition(
+                &scratch,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            )]);
+        }
+        list.close();
+        let drawn = || {
+            (0..RECORDS as usize)
+                // SAFETY: the mapped read-back buffer the list copied into.
+                .filter(|&i| unsafe { back_ptr.cast::<u32>().add(i * 4).read_volatile() } != 0)
+                .count()
+        };
+        for run in 0..2 {
+            // SAFETY: mapped, and the card is not using it now.
+            unsafe { std::ptr::write_bytes(back_ptr, 0xAB, bytes as usize) };
+            host.execute(&[&list]);
+            assert_eq!(drawn(), 2, "run {run}: two records fit the budget, two do not");
+        }
+        list.reset();
+        // SAFETY: a plain query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok(), "the device must stay");
+    }
+
+    /// Exercises `HostList::indirect_scratch`, `bound`, `Host::execute`,
+    /// and `HostList::reset` end-to-end on the host device: the scratch
+    /// buffer stays holding arguments between clamps of a list (no barrier
+    /// after each use) and the list's close brings it back to common.
     #[test]
     fn host_list_reuses_and_grows_scratch_across_submissions() {
+        let _device = one_at_a_time();
         let Some(host) = super::host() else {
             return;
         };
@@ -1174,12 +1496,15 @@ void main() {
             (count_ptr as *mut u32).write_volatile(2);
         }
 
+        let state = |list: &HostList| list.indirect_scratch(1).map(|(_, s)| s);
+        assert_eq!(state(&list), Some(D3D12_RESOURCE_STATE_COMMON), "a fresh scratch buffer is common");
+
         // First two calls fit inside the initial 64 KiB scratch buffer and
-        // must reuse the exact same `ID3D12Resource`.
+        // must reuse the exact same `ID3D12Resource`; the second clamp moves
+        // it from the argument state the first left it in.
         let b1 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64)).unwrap();
-        done(&list, &b1);
+        assert_eq!(state(&list), Some(D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT));
         let b2 = bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128)).unwrap();
-        done(&list, &b2);
         assert_eq!(
             b1.as_raw(),
             b2.as_raw(),
@@ -1187,23 +1512,25 @@ void main() {
         );
 
         // A call needing >64 KiB grows the scratch buffer mid-list while keeping
-        // `b1` alive until reset.
+        // `b1` alive until reset (the old one goes back to common at once).
         let b3 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000)).unwrap();
-        done(&list, &b3);
         assert_ne!(
             b3.as_raw(),
             b1.as_raw(),
             "larger request must grow scratch buffer"
         );
+        assert_eq!(state(&list), Some(D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT));
 
+        // The close brings it back to common: the list is valid (it closes,
+        // runs and resets without the device going).
         list.close();
+        assert_eq!(state(&list), Some(D3D12_RESOURCE_STATE_COMMON), "the close leaves the scratch buffer common");
         host.execute(&[&list]);
         list.reset();
 
         // After reset, requests up to the grown high-water mark reuse `b3` with
         // zero new allocations.
         let b4 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096)).unwrap();
-        done(&list, &b4);
         assert_eq!(
             b4.as_raw(),
             b3.as_raw(),
@@ -1212,5 +1539,7 @@ void main() {
         list.close();
         host.execute(&[&list]);
         list.reset();
+        // SAFETY: a plain query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok(), "the device must stay");
     }
 }

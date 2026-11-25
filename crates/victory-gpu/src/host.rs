@@ -603,6 +603,21 @@ fn create() -> windows::core::Result<Host> {
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
+        // Which card the device is on: the default adapter is the one the
+        // system puts first, and a PC with virtual display adapters (remote
+        // desktop, tablet screens) may not put the graphics card there.
+        match adapter.as_ref().map(|a| a.GetDesc1()) {
+            Some(Ok(desc)) => {
+                let name = String::from_utf16_lossy(&desc.Description);
+                tracing::info!(
+                    adapter = name.trim_end_matches('\0'),
+                    video_memory_mb = desc.DedicatedVideoMemory >> 20,
+                    software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
+                    "host adapter"
+                );
+            }
+            _ => tracing::warn!("host adapter not named by the system"),
+        }
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
@@ -735,11 +750,16 @@ pub(crate) struct HostList {
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// The work its indirect executions may still do (`indirect`): a
-    /// shader-writable word, zeroed when the list is submitted.
-    budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// shader-writable word, zeroed before the list's first clamp runs
+    /// ([`Budget`]).
+    budget: OnceLock<Option<Budget>>,
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
-    /// grown to the largest indirect execution recorded on the list.
-    indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// grown to the largest indirect execution recorded on the list, its
+    /// bytes, and whether the list has left it holding arguments (in the
+    /// indirect-argument state) so far: the draws that read it need no
+    /// barrier, the next clamp moves it from there, and the list's close
+    /// brings it back to the common state.
+    indirect_args: Mutex<Option<(ID3D12Resource, u64, bool)>>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -754,6 +774,68 @@ pub(crate) struct HostList {
 
 /// A list's prelude: an allocator and a closed list.
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
+
+/// Where a list's indirect-work budget lives (`crate::indirect`): the
+/// budget word, then the clamp's statistics of mesh records (the largest
+/// group count asked for, the groups asked in all).
+enum Budget {
+    /// In the PC's memory, mapped (`VICTORY_INDIRECT_BUDGET=pc`): zeroed by
+    /// the CPU at each submission, its statistics read back for the frame
+    /// line. Every clamp thread charges it with a loop of atomic exchanges
+    /// over the bus, and the threads of a window wait for each other there:
+    /// a window of 64 mesh records cost 17.7 microseconds a draw on an RTX
+    /// 5070 (`indirect::tests::indirect_draw_costs`), as the title's indirect
+    /// draws did in the timing run (88 ms of 4,970 a frame).
+    Pc(ID3D12Resource, usize),
+    /// In the card's memory (the default): 0.24 microseconds a draw for the
+    /// same windows. The list zeroes it itself before its first clamp
+    /// (`indirect::zero_budget`); its statistics are not read.
+    Card(BudgetSlot),
+}
+
+/// Whether budgets are in the PC's memory, as before ([`Budget::Pc`]).
+fn budget_in_pc() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_INDIRECT_BUDGET").as_deref() == Ok("pc"))
+}
+
+/// Budgets in the card's memory: 16 bytes each, cut from buffers of 64 KiB
+/// kept for the run; a list's slot is free again when the list goes.
+struct BudgetPool {
+    buffers: Vec<ID3D12Resource>,
+    free: Vec<u64>,
+}
+
+// SAFETY: D3D12 buffers (free-threaded) behind a lock.
+unsafe impl Send for BudgetPool {}
+
+static BUDGETS: Mutex<BudgetPool> = Mutex::new(BudgetPool { buffers: Vec::new(), free: Vec::new() });
+
+/// A list's budget words in the card's memory (their GPU address).
+struct BudgetSlot(u64);
+
+impl BudgetSlot {
+    fn take() -> Option<BudgetSlot> {
+        const SLOT: u64 = 16;
+        const BUFFER: u64 = 64 << 10;
+        let mut pool = BUDGETS.lock().unwrap_or_else(|e| e.into_inner());
+        if pool.free.is_empty() {
+            let buffer = host()?.uav_buffer(BUFFER)?;
+            name(&buffer, || "indirect budgets".to_owned());
+            // SAFETY: a live buffer.
+            let base = unsafe { buffer.GetGPUVirtualAddress() };
+            pool.free.extend((0..BUFFER / SLOT).rev().map(|i| base + i * SLOT));
+            pool.buffers.push(buffer);
+        }
+        pool.free.pop().map(BudgetSlot)
+    }
+}
+
+impl Drop for BudgetSlot {
+    fn drop(&mut self) {
+        BUDGETS.lock().unwrap_or_else(|e| e.into_inner()).free.push(self.0);
+    }
+}
 
 /// Whether a host list's prelude is made when the list first needs one. A
 /// prelude runs the texture transitions and twin copies a list needs before
@@ -2833,7 +2915,7 @@ impl Host {
                 prelude,
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
-                indirect_args: Mutex::default(),
+                indirect_args: Mutex::new(None),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -4406,6 +4488,7 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         self.twins_to_depth();
+        self.indirect_scratch_to_common();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -4435,6 +4518,10 @@ impl HostList {
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        // Its close brought the scratch buffer back to the common state.
+        if let Some((_, _, holds)) = &mut *self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()) {
+            *holds = false;
+        }
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -4980,15 +5067,33 @@ impl HostList {
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
-    /// submission of the list from the first use after a reset on.
+    /// submission of the list from the first use after a reset on ([`Budget`]).
     pub(crate) fn budget(&self) -> Option<u64> {
-        let (buffer, data) = self
+        let budget = self
             .budget
             .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
-                Some((b, d as usize))
+                if budget_in_pc() {
+                    let (b, d) = host()?.shared_buffer(256)?;
+                    Some(Budget::Pc(b, d as usize))
+                } else {
+                    BudgetSlot::take().map(Budget::Card)
+                }
             })
             .as_ref()?;
+        let (buffer, data) = match budget {
+            Budget::Pc(buffer, data) => (buffer, data),
+            Budget::Card(slot) => {
+                let mut deferred = self.deferred();
+                if !deferred.budget_zeroed {
+                    // Recorded in the list: each run of it zeroes it.
+                    if !crate::indirect::zero_budget(&self.list, slot.0) {
+                        return None;
+                    }
+                    deferred.budget_zeroed = true;
+                }
+                return Some(slot.0);
+            }
+        };
         let mut deferred = self.deferred();
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
@@ -5013,29 +5118,70 @@ impl HostList {
 
     /// A device-local unordered-access buffer of at least `size` bytes for
     /// clamped indirect arguments, reused across executions and resets of the
-    /// list. Smaller buffers replaced mid-list stay alive until
-    /// [`HostList::reset`].
-    pub(crate) fn indirect_scratch(&self, size: u64) -> Option<ID3D12Resource> {
+    /// list, and the state the list has left it in so far (common, or
+    /// indirect arguments: [`HostList::indirect_scratch_holds_arguments`]).
+    /// Smaller buffers replaced mid-list stay alive until
+    /// [`HostList::reset`], back in the common state.
+    pub(crate) fn indirect_scratch(&self, size: u64) -> Option<(ID3D12Resource, D3D12_RESOURCE_STATES)> {
         let needed = size.max(64 << 10);
         let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((buffer, cap)) = &*slot
+        if let Some((buffer, cap, holds)) = &*slot
             && *cap >= needed
         {
-            return Some(buffer.clone());
+            let state = if *holds { D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT } else { D3D12_RESOURCE_STATE_COMMON };
+            return Some((buffer.clone(), state));
         }
-        let prev = slot.as_ref().map_or(0, |(_, cap)| *cap);
+        let prev = slot.as_ref().map_or(0, |(_, cap, _)| *cap);
         let alloc = prev
             .saturating_mul(2)
             .max(needed)
             .next_multiple_of(64 << 10);
         let buffer = host()?.uav_buffer(alloc)?;
         name(&buffer, || format!("indirect arguments {alloc:#x}"));
-        let old = slot.replace((buffer.clone(), alloc));
+        let old = slot.replace((buffer.clone(), alloc, false));
         drop(slot);
-        if let Some((old_buf, _)) = old {
+        if let Some((old_buf, _, holds)) = old {
+            if holds {
+                // SAFETY: an open list; the old buffer holds arguments.
+                unsafe {
+                    self.list.ResourceBarrier(&[transition(
+                        &old_buf,
+                        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                        D3D12_RESOURCE_STATE_COMMON,
+                    )])
+                };
+            }
             self.keep(&old_buf);
         }
-        Some(buffer)
+        Some((buffer, D3D12_RESOURCE_STATE_COMMON))
+    }
+
+    /// A clamp has left the list's scratch buffer holding arguments, in
+    /// the indirect-argument state ([`HostList::indirect_scratch`]).
+    pub(crate) fn indirect_scratch_holds_arguments(&self) {
+        if let Some((_, _, holds)) = &mut *self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()) {
+            *holds = true;
+        }
+    }
+
+    /// The scratch buffer back in the common state, as every list leaves
+    /// it (once per list, not once per indirect execution: the barrier
+    /// after each one made the card finish every draw before the next).
+    fn indirect_scratch_to_common(&self) {
+        let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((buffer, _, holds)) = &mut *slot
+            && *holds
+        {
+            *holds = false;
+            // SAFETY: an open list; the buffer holds arguments.
+            unsafe {
+                self.list.ResourceBarrier(&[transition(
+                    buffer,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )])
+            };
+        }
     }
 
     /// Keeps `object` alive until the list is reset.
@@ -5675,9 +5821,12 @@ impl Meter {
         let indirect = crate::list::take_indirect() as f64 / frames;
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
-        tracing::info!(
-            "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
-        );
+        // Read back only from budgets in the PC's memory.
+        if budget_in_pc() {
+            tracing::info!(
+                "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
+            );
+        }
         late_line(frames);
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);

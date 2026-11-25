@@ -2409,13 +2409,15 @@ impl State {
                 } else {
                     crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
                 };
+                // The clamp's pipeline (or the budget's zeroing, recorded
+                // even when the clamp then is not) replaced the list's.
+                self.host_pipeline = 0;
+                self.host_roots[1] = 0;
                 let Some(bounded) = bounded else {
                     self.window = None;
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
                     return false;
                 };
-                self.host_pipeline = 0;
-                self.host_roots[1] = 0;
                 self.window = windowed.then(|| Window {
                     copy: args.id(),
                     kind,
@@ -2434,8 +2436,9 @@ impl State {
             DISPATCH => self.bind(list, p, true),
             _ => false,
         };
+        // The scratch buffer stays holding arguments either way: the list's
+        // close brings it back to the common state.
         if !ran {
-            crate::indirect::done(list, &bounded);
             why("prepare failed");
             return false;
         }
@@ -2461,7 +2464,6 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
-        crate::indirect::done(list, &bounded);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
