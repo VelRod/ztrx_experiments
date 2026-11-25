@@ -19,7 +19,9 @@ foreach ($v in "VICTORY_KEYS", "VICTORY_CAPTURE", "VICTORY_CAPTURE_FRAMES", "VIC
 # of 1 MB or more get their copy in the card's memory, up to 1 GB of them
 # (CARD_BUFFERS_*), hashed once per run of pieces (CARD_REHASH_RUNS); a
 # texture refresh does not wait while title memory is being remapped
-# (TEXTURE_NO_WAIT).
+# (TEXTURE_NO_WAIT). Less for the buffers does not make room for textures:
+# with 512 MB the card filled with more textures all the same, at 2.9 fps
+# against 6.5 (2026-11-25, prologue).
 $fast = [ordered]@{
     VICTORY_RELAY               = '2'
     VICTORY_WIDE_BACK           = '1'

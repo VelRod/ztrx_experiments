@@ -5059,6 +5059,37 @@ impl HostList {
         Some((gpu + at, (data + at as usize) as *mut u8))
     }
 
+    /// `len` bytes of the list's scratch memory at a texture placement
+    /// alignment (512), for a copy into a texture: the chunk's buffer, the
+    /// offset in it and the chunk's mapping (its first byte). Valid until
+    /// the list is reset, after its submissions ran; none past a chunk's
+    /// size (the caller makes a buffer of its own).
+    pub(crate) fn scratch_placed(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        const ALIGN: u64 = 512;
+        if len > SCRATCH_CHUNK {
+            return None;
+        }
+        let host = host()?;
+        let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        let len = len.max(1).next_multiple_of(ALIGN);
+        // As `scratch`: the chunk in use while `len` fits after the
+        // aligned start, else the next one.
+        while s.current < s.chunks.len()
+            && s.used.next_multiple_of(ALIGN) + len > s.chunks[s.current].1
+        {
+            (s.current, s.used) = (s.current + 1, 0);
+        }
+        if s.current == s.chunks.len() {
+            let chunk = take_chunk(host, SCRATCH_CHUNK)?;
+            s.chunks.push((chunk, SCRATCH_CHUNK));
+            s.used = 0;
+        }
+        let at = s.used.next_multiple_of(ALIGN);
+        s.used = at + len;
+        let chunk = &s.chunks[s.current].0;
+        Some((chunk._buffer.clone(), at, chunk.data as *mut u8))
+    }
+
     /// The bytes of scratch chunks the list holds now (after a reset:
     /// none while lists share their chunks).
     pub(crate) fn scratch_kept(&self) -> u64 {
@@ -5902,7 +5933,8 @@ impl Meter {
                      as read through a table, {parts} uploads of textures not all mapped ({tails} of them without their first page), \
                      {same} looks that found no more mapped; {} slots made stale by a newer view of other memory there, \
                      {} ranges of memory mapped, unmapped or written under texture views ({} dropped), {} slots made due by them, \
-                     {} made slots found unmapped and made null",
+                     {} made slots found unmapped and made null; {:.1} s making them ready since the start, {} staging \
+                     buffers in lists' scratch memory ({} MB)",
                     crate::draw::HEAP_TEXTURES_TABLED.load(Ordering::Relaxed),
                     crate::descriptor::host::TABLED_WRITES[0].load(Ordering::Relaxed),
                     crate::descriptor::host::TABLED_WRITES[1].load(Ordering::Relaxed),
@@ -5910,7 +5942,10 @@ impl Meter {
                     crate::descriptor::host::STALE[1].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[2].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[3].load(Ordering::Relaxed),
-                    crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
+                    crate::descriptor::host::STALE[4].load(Ordering::Relaxed),
+                    crate::draw::HEAP_TEXTURE_MICROS.load(Ordering::Relaxed) as f64 / 1e6,
+                    crate::texture::FROM_SCRATCH_MADE[0].load(Ordering::Relaxed),
+                    crate::texture::FROM_SCRATCH_MADE[1].load(Ordering::Relaxed) >> 20
                 );
             }
             #[cfg(feature = "diagnostics")]
@@ -6627,5 +6662,34 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
         );
+    }
+}
+
+#[cfg(test)]
+mod scratch_placed {
+    /// Places in a list's scratch memory for texture uploads: aligned to
+    /// 512, apart, in one chunk while they fit and the next one after; none
+    /// past a chunk's size.
+    #[test]
+    fn places_are_aligned_apart_and_within_chunks() {
+        let Some(host) = super::host() else {
+            eprintln!("no graphics card: not run");
+            return;
+        };
+        let list = host.new_list().unwrap();
+        // the list's own scratch first, to start off the alignment
+        list.scratch(100).unwrap();
+        let (a, at_a, base_a) = list.scratch_placed(1000).unwrap();
+        let (b, at_b, base_b) = list.scratch_placed(3 << 20).unwrap();
+        assert_eq!((at_a % 512, at_b % 512), (0, 0));
+        if a == b {
+            assert_eq!(base_a, base_b, "one chunk, one mapping");
+            assert!(at_a + 1000 <= at_b, "apart");
+        }
+        assert!(at_b + (3 << 20) <= super::SCRATCH_CHUNK);
+        // past what is left of the chunk: the next one, from its start
+        let (c, at_c, _) = list.scratch_placed(3 << 20).unwrap();
+        assert!(c != b && at_c == 0);
+        assert!(list.scratch_placed(super::SCRATCH_CHUNK + 1).is_none());
     }
 }
