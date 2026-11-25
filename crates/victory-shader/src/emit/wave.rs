@@ -360,14 +360,16 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             continue;
         }
         if let Fields::Sop { src, .. } = &inst.fields {
-            // A copy keeps what the simulation found (a reduction read into a scalar, moved).
+            // A copy of what the section computed keeps what the simulation found (a
+            // reduction read into a scalar, moved); other scalars, masks among them, stay
+            // unknown as before.
             if name == "s_mov_b32"
                 && let Some(&(_, w)) = inst.writes.first()
             {
                 let s = match src.first() {
-                    Some(&Operand::Scalar { code, .. }) if code != NULL => inst
-                        .read(Reg::S(code))
-                        .map(|x| uni.get(&x).copied().unwrap_or(Sym::Uni(x))),
+                    Some(&Operand::Scalar { code, .. }) if code != NULL => {
+                        inst.read(Reg::S(code)).and_then(|x| uni.get(&x).copied())
+                    }
                     Some(&Operand::Const(c)) => crate::resource::inline(c).map(Sym::K),
                     Some(&Operand::Literal(x)) => Some(Sym::K(x)),
                     _ => None,
