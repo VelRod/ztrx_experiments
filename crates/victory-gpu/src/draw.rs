@@ -343,6 +343,10 @@ pub(crate) static HEAP_TEXTURES_TABLED: AtomicU64 = AtomicU64::new(0);
 /// (`TextureQueue::census`): slots in it, due, waiting for their memory,
 /// uploaded in part, and the frames the oldest due one has waited.
 pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// At the last pass: slots whose texture's host copy is held for shaders
+/// that pick it by index, and slots let go because none picked them lately
+/// (`HostHeap::texture_residency`).
+pub(crate) static HEAP_TEXTURES_HELD: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// Microseconds the pass over textures picked by index spent making them
 /// ready (host copy, staging, recording), since the start.
 pub(crate) static HEAP_TEXTURE_MICROS: AtomicU64 = AtomicU64::new(0);
@@ -682,9 +686,13 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{USER_FRAME, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
+        }
+        if kind == USER_FRAME {
+            // What shaders store in the read marks: never 0, which is "none".
+            return (crate::frame::current() as u32).wrapping_add(1).max(1);
         }
         if kind == USER_VIEW_BIAS {
             // The view begins on 16 bytes of the copy the address finds
@@ -718,6 +726,16 @@ impl State {
         } else {
             (address >> 32) as u32
         }
+    }
+
+    /// The host heap of the view heap the list has set.
+    fn view_heap<'a>(&self) -> Option<&'a crate::descriptor::host::HostHeap> {
+        self.heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())?
+            .host()
     }
 
     /// For a shader that reads title memory by address
@@ -1027,6 +1045,25 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
+                if slot == victory_shader::emit::SLOT_READS {
+                    // Ours: where shaders mark the textures they pick by
+                    // index. A draw without them would store through an
+                    // address of 0.
+                    let Some(gpu) = self.view_heap().and_then(|h| h.reads_gpu(list)) else {
+                        once!("a shader that marks the textures it picks by index, without read marks: the draw is dropped");
+                        return false;
+                    };
+                    // SAFETY: an open list; the marks live as long as the
+                    // heap, which the list holds.
+                    unsafe {
+                        if compute {
+                            l.SetComputeRootUnorderedAccessView(param, gpu);
+                        } else {
+                            l.SetGraphicsRootUnorderedAccessView(param, gpu);
+                        }
+                    }
+                    continue;
+                }
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
                     if let Some(m) = &memory {
@@ -1472,7 +1509,22 @@ impl State {
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
         host.texture_slots_remapped(frame);
+        // What shaders picked (their read marks): when the card's memory is
+        // short, textures none picked for a while are let go; those picked
+        // again are due again.
+        let short = !room || crate::resource::short();
+        let [gone, parked, back] = host.texture_residency(frame, short, !room, crate::descriptor::host::heap_idle());
+        if gone + parked + back > 0 {
+            crate::host::trail(|| {
+                format!(
+                    "textures picked by index: {gone} let go (no shader picked them lately), {parked} due ones let go unmade (no room), {back} picked again and due"
+                )
+            });
+        }
         let (due, census) = host.texture_slots_due(frame, 4096);
+        for (count, now) in HEAP_TEXTURES_HELD.iter().zip(host.texture_residency_counts()) {
+            count.store(now, Ordering::Relaxed);
+        }
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
@@ -1551,6 +1603,7 @@ impl State {
                 && crate::resource::buffer_bytes(object as This).is_none()
                 && !crate::resource::title_fills(object as This)
             {
+                host.texture_slot_not_held(index);
                 host.texture_slot_done(index, write, None);
                 continue;
             }
@@ -1575,9 +1628,13 @@ impl State {
             let title_fills = crate::resource::host_resource(resource).is_some_and(crate::texture::title_written);
             if !title_fills {
                 // a render target, a depth or unordered access texture: the host's own
+                host.texture_slot_not_held(index);
                 host.texture_slot_done(index, write, None);
                 continue;
             }
+            // Its host copy is held by the slot from here on, until no
+            // shader picks it for a while.
+            host.texture_slot_held(index, resource as usize);
             // A texture that has a staging buffer now is one draws read
             // through a table: they upload it, and check it at every
             // submission that samples it.
