@@ -343,6 +343,9 @@ pub(crate) static HEAP_TEXTURES_TABLED: AtomicU64 = AtomicU64::new(0);
 /// (`TextureQueue::census`): slots in it, due, waiting for their memory,
 /// uploaded in part, and the frames the oldest due one has waited.
 pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// Microseconds the pass over textures picked by index spent making them
+/// ready (host copy, staging, recording), since the start.
+pub(crate) static HEAP_TEXTURE_MICROS: AtomicU64 = AtomicU64::new(0);
 /// Since the start: looks at a slot uploaded in part that found no more of
 /// its memory mapped; uploads of textures not all mapped; and of those,
 /// the ones whose first page was not there (asked by the first page alone,
@@ -1579,9 +1582,15 @@ impl State {
             // through a table: they upload it, and check it at every
             // submission that samples it.
             let tabled = crate::texture::is_staged(resource);
-            if let Some(view) = &view {
-                readable(list, sampled.kind, view);
-            }
+            let making = std::time::Instant::now();
+            // (its staging buffer in the list's scratch memory: given up
+            // below once recorded)
+            let scratch = crate::texture::upload_from_scratch(|| {
+                if let Some(view) = &view {
+                    readable(list, sampled.kind, view);
+                }
+            });
+            HEAP_TEXTURE_MICROS.fetch_add(making.elapsed().as_micros() as u64, Ordering::Relaxed);
             // A texture view the host refuses removes the device: name it.
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !GONE.load(Ordering::Relaxed)
@@ -1593,7 +1602,7 @@ impl State {
                 crate::host::log_removal_context();
                 return;
             }
-            let (bytes, whole) = crate::texture::staged(resource).unwrap_or((0, true));
+            let (bytes, whole) = scratch.or_else(|| crate::texture::staged(resource)).unwrap_or((0, true));
             // Not all of it there: looked at again next frame, and from
             // then on as a slot with nothing new (a placed texture: until
             // more of it is mapped; a texture object at an address the

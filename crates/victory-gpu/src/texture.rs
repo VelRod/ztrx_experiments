@@ -336,6 +336,38 @@ fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
 }
 
 thread_local! {
+    /// Set by the pass over textures picked by index around its upload of
+    /// one ([`upload_from_scratch`]); what that upload staged, for it.
+    static FROM_SCRATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SCRATCH_STAGED: std::cell::Cell<Option<(u64, bool)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Staging buffers made in a list's scratch memory, and their bytes.
+pub(crate) static FROM_SCRATCH_MADE: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Runs `f` (the upload of one texture a pass over textures picked by index
+/// makes ready) with its staging buffer, if it makes one, in `list`'s
+/// scratch memory rather than an upload buffer of its own, and kept by the
+/// list alone: such an upload is recorded once and its staging buffer
+/// given up at once ([`unstage`]). An upload buffer made per texture (and
+/// freed after its list ran) cost more than the texture itself: 0.5 ms
+/// against 0.3 ms for 344 KiB, 1.8 against 0.4 for 5.3 MiB, and as much
+/// again to free (`cost_tests`), and some 24,000 such textures fall due
+/// when the title's world starts. Returns what it staged: the texture
+/// memory's bytes and whether all of it is mapped.
+/// `VICTORY_HEAP_TEXTURE_SCRATCH=0`: upload buffers of their own, as before.
+pub(crate) fn upload_from_scratch(f: impl FnOnce()) -> Option<(u64, bool)> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURE_SCRATCH").is_none_or(|v| v != "0"));
+    SCRATCH_STAGED.set(None);
+    FROM_SCRATCH.set(on);
+    f();
+    FROM_SCRATCH.set(false);
+    SCRATCH_STAGED.take()
+}
+
+thread_local! {
     /// Room to read a texture's memory into: one buffer per submitting
     /// thread. Each texture kept its own, a second copy in memory of every
     /// write-watched or partly mapped texture ever sampled, for the run.
@@ -509,7 +541,22 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     if host_written || !list.first_use(resource as usize) {
         return;
     }
-    let Some(staging) = staging(resource, texture) else {
+    // A staging buffer a table read made stays the one; else, for the pass
+    // over textures picked by index, one in the list's scratch memory.
+    let kept = || {
+        let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        map.as_ref()?.get(&(resource as usize)).cloned()
+    };
+    let staging = match kept() {
+        Some(s) => Some(s),
+        None if FROM_SCRATCH.get() => new_staging(resource, texture, Some(list)).map(|s| {
+            let size = s.layout.size as usize;
+            SCRATCH_STAGED.set(Some((size as u64, committed(s.memory, size))));
+            Arc::new(s)
+        }),
+        None => staging(resource, texture),
+    };
+    let Some(staging) = staging else {
         return;
     };
     use std::sync::atomic::Ordering::Relaxed;
@@ -988,6 +1035,15 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     if let Some(s) = map.get(&(resource as usize)) {
         return Some(s.clone());
     }
+    let s = Arc::new(new_staging(resource, texture, None)?);
+    map.insert(resource as usize, s.clone());
+    Some(s)
+}
+
+/// A new staging buffer for `resource`'s host copy `texture`: in `list`'s
+/// scratch memory when given and the buffer fits a chunk of it, else an
+/// upload buffer of its own.
+fn new_staging(resource: This, texture: &ID3D12Resource, list: Option<&HostList>) -> Option<Staging> {
     let (memory, desc) = crate::resource::texture_memory(resource)?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
     else {
@@ -1025,17 +1081,31 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
-    let (buffer, data) = host.upload_buffer(total)?;
-    crate::host::name(&buffer, || {
-        format!(
-            "staging of {resource:?} {}x{}x{} f{}",
-            d.Width, d.Height, d.DepthOrArraySize, d.Format.0
-        )
-    });
+    let (buffer, data) = match list.and_then(|l| l.scratch_placed(total)) {
+        Some((buffer, base, data)) => {
+            // The footprints' offsets are the buffer's, from the place given.
+            for f in &mut footprints {
+                f.Offset += base;
+            }
+            FROM_SCRATCH_MADE[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            FROM_SCRATCH_MADE[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+            (buffer, data)
+        }
+        None => {
+            let (buffer, data) = host.upload_buffer(total)?;
+            crate::host::name(&buffer, || {
+                format!(
+                    "staging of {resource:?} {}x{}x{} f{}",
+                    d.Width, d.Height, d.DepthOrArraySize, d.Format.0
+                )
+            });
+            (buffer, data)
+        }
+    };
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
-    let s = Arc::new(Staging {
+    Some(Staging {
         buffer,
         #[cfg(feature = "diagnostics")]
         size: total,
@@ -1050,9 +1120,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
-    });
-    map.insert(resource as usize, s.clone());
-    Some(s)
+    })
 }
 
 #[cfg(test)]
@@ -1162,6 +1230,96 @@ mod title_memory_tests {
                     .expect("the staging buffer's bytes are enough");
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod cost_tests {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+
+    /// What making a texture picked by index costs on the host thread: a
+    /// committed texture in the card's memory and a committed upload buffer
+    /// of its size, each made and let go, for BC7 textures of 512, 1024 and
+    /// 2048 texels a side with their mips (RTX 5070: 0.28, 0.31, 0.41 ms a
+    /// texture; 0.49, 1.0, 1.8 ms an upload buffer; 0.4, 0.8, 1.2 ms to let
+    /// both go). Run with `-- --ignored --nocapture heap_texture_costs`.
+    #[test]
+    #[ignore = "a measurement on the graphics card"]
+    fn heap_texture_costs() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("no graphics card: nothing measured");
+            return;
+        };
+        const N: usize = 300;
+        for side in [512u64, 1024, 2048] {
+            let mips = 64 - side.leading_zeros() as u16;
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: side,
+                Height: side as u32,
+                DepthOrArraySize: 1,
+                MipLevels: mips,
+                Format: DXGI_FORMAT_BC7_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                ..Default::default()
+            };
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let mut total = 0u64;
+            // SAFETY: a plain query.
+            unsafe {
+                host.device.GetCopyableFootprints(
+                    &desc,
+                    0,
+                    u32::from(mips),
+                    0,
+                    None,
+                    None,
+                    None,
+                    Some(&mut total),
+                )
+            };
+            let mut textures = Vec::new();
+            let began = std::time::Instant::now();
+            for _ in 0..N {
+                let mut t: Option<ID3D12Resource> = None;
+                // SAFETY: plain creation.
+                unsafe {
+                    host.device
+                        .CreateCommittedResource(
+                            &heap,
+                            D3D12_HEAP_FLAG_NONE,
+                            &desc,
+                            D3D12_RESOURCE_STATE_COMMON,
+                            None,
+                            &mut t,
+                        )
+                        .unwrap();
+                }
+                textures.push(t);
+            }
+            let texture_ms = began.elapsed().as_secs_f64() * 1e3 / N as f64;
+            let began = std::time::Instant::now();
+            let mut uploads = Vec::new();
+            for _ in 0..N {
+                uploads.push(host.upload_buffer(total).unwrap());
+            }
+            let upload_ms = began.elapsed().as_secs_f64() * 1e3 / N as f64;
+            let began = std::time::Instant::now();
+            drop(textures);
+            drop(uploads);
+            let release_ms = began.elapsed().as_secs_f64() * 1e3 / N as f64;
+            eprintln!(
+                "per texture of {} KiB: committed texture {texture_ms:.3} ms, upload buffer {upload_ms:.3} ms, both let go {release_ms:.3} ms",
+                total >> 10
+            );
         }
     }
 }
