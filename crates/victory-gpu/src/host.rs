@@ -5947,6 +5947,12 @@ impl Meter {
                     crate::texture::FROM_SCRATCH_MADE[0].load(Ordering::Relaxed),
                     crate::texture::FROM_SCRATCH_MADE[1].load(Ordering::Relaxed) >> 20
                 );
+                let [held, parked] = [0, 1].map(|i| crate::draw::HEAP_TEXTURES_HELD[i].load(Ordering::Relaxed));
+                let [gone, unmade, back] =
+                    [0, 1, 2].map(|i| crate::descriptor::host::RESIDENCY[i].load(Ordering::Relaxed));
+                tracing::info!(
+                    "textures picked by index, residency: {held} slots hold their texture's host copy, {parked} let go until a shader picks them; since the start: {gone} let go because no shader picked them lately, {unmade} due ones let go unmade while the card had no room, {back} picked again and made due"
+                );
             }
             #[cfg(feature = "diagnostics")]
             tracing::info!(

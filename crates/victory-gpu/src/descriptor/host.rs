@@ -86,6 +86,114 @@ pub(crate) struct HostHeap {
     /// other memory there makes stale, and which to look at again when the
     /// runtime maps, unmaps or writes memory ([`remapped`]).
     placed: Mutex<Spans>,
+    /// View heaps: the read marks of shaders that pick textures from the
+    /// heap by a computed index ([`Reads`]), made when a shader first binds
+    /// them.
+    reads: std::sync::OnceLock<Option<Reads>>,
+    /// One past the highest title slot written with a texture view so far:
+    /// the marks past it are not copied for the CPU.
+    texture_end: std::sync::atomic::AtomicU32,
+}
+
+/// The read marks of shaders that pick texture views from a view heap by an
+/// index they compute (`victory_shader::emit::SLOT_READS`): per slot, the
+/// stamp of the last frame in which one did. What tells the host which of
+/// the textures such shaders could pick are drawn: the pass over textures
+/// picked by index made and kept a host copy of every one a slot named
+/// (1,300 to 3,300 of them waited for room on a full card at the end of
+/// runs t1-t4, 2026-11-25), drawn or not.
+pub(crate) struct Reads {
+    /// Where shaders store them: `READS_COUNT` dwords in the card's memory,
+    /// and its GPU address.
+    marks: ID3D12Resource,
+    gpu: u64,
+    /// A copy of the title slots' dwords the CPU reads, made by the first
+    /// list of each frame that binds the marks, and its mapping. Read while
+    /// the card may be writing it: a stamp read is one of a copy, older or
+    /// newer, and stamps only grow.
+    copy: ID3D12Resource,
+    data: *const u32,
+    dwords: u32,
+    /// The frame of the last copy.
+    frame: std::sync::atomic::AtomicU64,
+}
+
+// SAFETY: D3D12 objects are free-threaded; the mapping is of a buffer the
+// struct owns, read with volatile reads alone.
+unsafe impl Send for Reads {}
+// SAFETY: as above.
+unsafe impl Sync for Reads {}
+
+impl Reads {
+    fn new(dwords: u32) -> Option<Reads> {
+        use victory_shader::emit::READS_COUNT;
+        let host = host()?;
+        let marks = host.uav_buffer(u64::from(READS_COUNT) * 4)?;
+        crate::host::name(&marks, || "read marks of textures picked by index".to_owned());
+        let dwords = dwords.clamp(1, READS_COUNT);
+        let bytes = u64::from(dwords) * 4;
+        let copy = host.read_back_buffer(bytes)?;
+        crate::host::name(&copy, || "read marks of textures picked by index, for the CPU".to_owned());
+        let mut data = std::ptr::null_mut();
+        let range = D3D12_RANGE { Begin: 0, End: bytes as usize };
+        // SAFETY: a read-back buffer of ours, mapped for the struct's life.
+        unsafe { copy.Map(0, Some(&range), Some(&mut data)) }.ok()?;
+        if data.is_null() {
+            return None;
+        }
+        // SAFETY: a live buffer.
+        let gpu = unsafe { marks.GetGPUVirtualAddress() };
+        tracing::info!(dwords, "read marks: shaders mark the texture views they pick by index");
+        Some(Reads {
+            marks,
+            gpu,
+            copy,
+            data: data.cast::<u32>().cast_const(),
+            dwords,
+            frame: std::sync::atomic::AtomicU64::new(u64::MAX),
+        })
+    }
+}
+
+/// Since the start: host slots of textures picked by index let go because
+/// no shader picked them for a while; due slots let go for that reason
+/// while the card had no room (none was made); slots let go that a shader
+/// then picked, made due again.
+pub(crate) static RESIDENCY: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Whether host copies of textures no shader picked lately are let go;
+/// `VICTORY_HEAP_LET_GO=0` keeps them all, as before, while shaders still
+/// mark what they pick (to tell a texture missing because it was let go
+/// from one missing for another reason, without translating anew).
+fn let_go() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_LET_GO").is_none_or(|v| v != "0"))
+}
+
+/// How long no shader may pick a texture by index before its host copy is
+/// let go: `VICTORY_HEAP_IDLE_MS` milliseconds (10 s if unset) and 32
+/// frames, both.
+pub(crate) fn heap_idle() -> Idle {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let ms = *MS.get_or_init(|| {
+        std::env::var("VICTORY_HEAP_IDLE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(10_000)
+    });
+    Idle { frames: 32, ms }
+}
+
+/// Whether `view` is of a texture the title fills itself (placed, or a
+/// texture object the host neither renders to nor writes): one whose host
+/// copy can be made again from title memory.
+fn title_filled(view: &View) -> bool {
+    match view {
+        View::Placed(false, resource, _) => resource[0] != 1,
+        View::Shader(r, _) => {
+            let r = *r as crate::object::This;
+            crate::resource::buffer_bytes(r).is_none() && crate::resource::title_fills(r)
+        }
+        _ => false,
+    }
 }
 
 /// Title memory by the placed texture views that describe it: per span of
@@ -289,6 +397,35 @@ struct Waiting {
     /// Bytes of its memory that were mapped when it was last uploaded
     /// without all of it there; 0: not uploaded yet.
     mapped: u64,
+    /// A shader picked it while it was let go ([`TextureQueue::revive`]):
+    /// served before the slots no shader is known to want.
+    wanted: bool,
+}
+
+/// What the queue knows of a slot whose texture the pass made a host copy
+/// of: the read stamp last seen there (`victory_shader::emit::SLOT_READS`),
+/// and the frame and the moment (`crate::host::now_ms`) it was first seen;
+/// and the title resource whose host copy it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Held {
+    stamp: u32,
+    frame: u64,
+    ms: u64,
+    resource: usize,
+}
+
+/// How long no shader may pick a slot's texture before its host copy is let
+/// go ([`TextureQueue::unread`]): frames, and milliseconds.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Idle {
+    pub(crate) frames: u64,
+    pub(crate) ms: u64,
+}
+
+/// Whether read stamp `stamp` (the frame plus one, 0: never) is of frame
+/// `frame` or later.
+pub(crate) fn read_since(stamp: u32, frame: u64) -> bool {
+    stamp != 0 && u64::from(stamp - 1) >= frame & u64::from(u32::MAX)
 }
 
 /// The queue of title slots whose texture view waits to be brought up to
@@ -298,6 +435,15 @@ struct Waiting {
 pub(crate) struct TextureQueue {
     slots: std::collections::BTreeMap<u32, Waiting>,
     writes: u64,
+    /// Slots whose texture the pass made a host copy of
+    /// ([`TextureQueue::held_now`]), until no shader picks them for a while
+    /// ([`TextureQueue::unread`]), the title writes them with no texture,
+    /// or a draw reads them through a table.
+    held: std::collections::HashMap<u32, Held>,
+    /// Slots let go because no shader picked them for a while, with the
+    /// read stamp they had then: out of the queue until a shader picks one
+    /// again ([`TextureQueue::revive`]) or the title writes it.
+    parked: std::collections::HashMap<u32, u32>,
 }
 
 impl TextureQueue {
@@ -311,11 +457,17 @@ impl TextureQueue {
         }
         self.writes += 1;
         let write = self.writes;
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0 });
+        self.parked.remove(&index);
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, wanted: false });
     }
 
-    fn remove(&mut self, index: u32) {
-        self.slots.remove(&index);
+    /// Slot `index` holds no texture the pass looks after any more (none at
+    /// all, or one a draw read through a table): out of the queue, and no
+    /// longer held or let go. True if it was in the queue.
+    fn remove(&mut self, index: u32) -> bool {
+        self.held.remove(&index);
+        self.parked.remove(&index);
+        self.slots.remove(&index).is_some()
     }
 
     /// Up to `max` slots due at `frame`, each with its write number, in
@@ -328,18 +480,38 @@ impl TextureQueue {
     ///   25,000-40,000 while the textures of the shot on screen waited
     ///   (run 52: 98% of the drawn pixels had no colour texture in the
     ///   first 3D frames).
+    #[cfg(test)]
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+        self.due_by(frame, max, |_| 0)
+    }
+
+    /// [`TextureQueue::due`], where `stamp` gives each slot's read stamp
+    /// (`victory_shader::emit::SLOT_READS`): after the slots looked at
+    /// before come those a shader picked since their write (or while they
+    /// were let go), newest first, and only then the others. In the backlog
+    /// of 24,000 slots at the start of the world, the textures being drawn
+    /// waited behind those only named.
+    fn due_by(&self, frame: u64, max: usize, stamp: impl Fn(u32) -> u32) -> Vec<(u32, u64)> {
         let mut again: Vec<(u64, u32, u64)> = Vec::new();
+        let mut wanted: Vec<(u64, u32, u64)> = Vec::new();
         let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
-            let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
+            let class = if w.looks > 0 || w.mapped > 0 {
+                &mut again
+            } else if w.wanted || read_since(stamp(index), w.written) {
+                &mut wanted
+            } else {
+                &mut fresh
+            };
             class.push((w.written, index, w.write));
         }
         // By the number of the write, counted over the run.
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
         again.sort_unstable_by(newest_first);
+        wanted.sort_unstable_by(newest_first);
         fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
+        let mut order: Vec<(u32, u64)> =
+            again.iter().chain(&wanted).map(|&(_, index, write)| (index, write)).collect();
         let (mut new, mut old) = (0, fresh.len());
         while new < old && order.len() < max {
             order.push((fresh[new].1, fresh[new].2));
@@ -386,11 +558,110 @@ impl TextureQueue {
     /// written in `frame`: the slot is looked at from frame `due` as one
     /// written now, whatever was known of it (a pass at work on it does
     /// not take it out).
+    /// A slot let go stays so: nothing of it is on the card to bring up to
+    /// date, and the shader that picks it next is given what is there then.
     fn changed(&mut self, index: u32, frame: u64, due: u64) {
+        if self.parked.contains_key(&index) {
+            return;
+        }
         self.writes += 1;
         let write = self.writes;
-        let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0 });
+        let (due, wanted) = self.slots.get(&index).map_or((due, false), |w| (w.due.min(due), w.wanted));
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, wanted });
+    }
+
+    /// The pass made a host copy of slot `index`'s texture (of title
+    /// resource `resource`) in `frame` at `ms`, where the read stamp was
+    /// `stamp`.
+    fn held_now(&mut self, index: u32, stamp: u32, frame: u64, ms: u64, resource: usize) {
+        self.parked.remove(&index);
+        self.held.insert(index, Held { stamp, frame, ms, resource });
+    }
+
+    /// The held slots no shader picked for `idle` (frames and milliseconds,
+    /// both) by `frame` and `ms`, with their stamps and title resources: a
+    /// stamp that moved since it was last seen starts the time anew. The
+    /// caller lets each go ([`TextureQueue::park`]) or keeps it held.
+    /// None while no held slot shows a mark of the last `idle.frames`
+    /// frames: then the marks are not being seen (their copy for the CPU
+    /// stopped, say), or nothing picks textures by index, and every slot
+    /// would look unread alike.
+    fn unread(&mut self, frame: u64, ms: u64, idle: Idle, stamp: impl Fn(u32) -> u32) -> Vec<(u32, u32, usize)> {
+        let lately = frame.saturating_sub(idle.frames);
+        let (mut out, mut alive) = (Vec::new(), false);
+        for (&index, held) in &mut self.held {
+            let now = stamp(index);
+            alive |= read_since(now, lately);
+            if now != held.stamp {
+                (held.stamp, held.frame, held.ms) = (now, frame, ms);
+                continue;
+            }
+            if frame.saturating_sub(held.frame) >= idle.frames && ms.saturating_sub(held.ms) >= idle.ms {
+                out.push((index, now, held.resource));
+            }
+        }
+        if !alive {
+            return Vec::new();
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// Slot `index` is let go with read stamp `stamp`: out of the queue and
+    /// no longer held, until a shader picks it again or the title writes
+    /// it.
+    fn park(&mut self, index: u32, stamp: u32) {
+        self.held.remove(&index);
+        self.slots.remove(&index);
+        self.parked.insert(index, stamp);
+    }
+
+    /// The card has no room for more: the due slots with no host copy held
+    /// that no shader picked since their write, `idle.frames` frames ago or
+    /// more, are let go as held ones are (they would wait for room that
+    /// only textures being drawn should take). Returns them.
+    fn park_waiting(&mut self, frame: u64, idle: Idle, stamp: impl Fn(u32) -> u32) -> Vec<u32> {
+        let mut out = Vec::new();
+        for (&index, w) in &self.slots {
+            let unread = !w.wanted && !read_since(stamp(index), w.written);
+            if w.due <= frame
+                && unread
+                && w.mapped == 0
+                && frame.saturating_sub(w.written) >= idle.frames
+                && !self.held.contains_key(&index)
+            {
+                out.push(index);
+            }
+        }
+        for &index in &out {
+            let now = stamp(index);
+            self.park(index, now);
+        }
+        out
+    }
+
+    /// The slots let go that a shader picked since (their stamp moved):
+    /// due from `frame` on, ahead of the slots no shader is known to want.
+    fn revive(&mut self, frame: u64, stamp: impl Fn(u32) -> u32) -> Vec<u32> {
+        let mut back: Vec<u32> = self
+            .parked
+            .iter()
+            .filter(|&(&index, &then)| stamp(index) != then)
+            .map(|(&index, _)| index)
+            .collect();
+        back.sort_unstable();
+        for &index in &back {
+            self.written(index, frame, 0, false);
+            if let Some(w) = self.slots.get_mut(&index) {
+                w.wanted = true;
+            }
+        }
+        back
+    }
+
+    /// For the frame line: slots whose host copy is held, and slots let go.
+    fn residency(&self) -> [u64; 2] {
+        [self.held.len() as u64, self.parked.len() as u64]
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -639,6 +910,8 @@ impl HostHeap {
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
             placed: Mutex::default(),
+            reads: std::sync::OnceLock::new(),
+            texture_end: std::sync::atomic::AtomicU32::new(0),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -791,7 +1064,176 @@ impl HostHeap {
     /// ([`TextureQueue::census`]).
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
+        let due = if max == 0 { Vec::new() } else { textures.due_by(frame, max, |i| self.read_stamp(i)) };
+        (due, textures.census(frame))
+    }
+
+    /// For a shader that marks the texture views it picks from this heap by
+    /// index (`victory_shader::emit::SLOT_READS`), bound in `list`: the GPU
+    /// address of the marks. The first list of each frame to bind them
+    /// copies them for the CPU first ([`HostHeap::read_stamp`]). None for a
+    /// sampler heap, or if the buffers cannot be made.
+    pub(crate) fn reads_gpu(&self, list: &crate::host::HostList) -> Option<u64> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.sampler {
+            return None;
+        }
+        let reads = self.reads.get_or_init(|| Reads::new(self.count)).as_ref()?;
+        // The marks are a buffer: its first use in a submission takes it
+        // from the common state to the unordered access state, and the end
+        // of the submission brings it back. So no barrier but around the
+        // copy. (A barrier at each list's first use and close made the card
+        // finish all the list's work so far, some fifty times a frame: 5.0-5.3
+        // fps against 5.8-6.0 without, one run each, h2 and h7.)
+        const BOUND: usize = usize::MAX - 0x5d;
+        let first = list.first_use(BOUND);
+        if first {
+            list.keep(&reads.marks);
+        }
+        let frame = crate::frame::current();
+        if reads.frame.swap(frame, Relaxed) != frame {
+            let l = &list.list;
+            // SAFETY: an open list; our buffers, the list holds them.
+            unsafe {
+                // At the list's first use the copy itself takes the marks
+                // from the common state; later, a draw of the list has.
+                // shortcut: a list submitted after another in one call finds
+                // the marks where that one left them (states decay between
+                // calls only): its copy may miss marks still being written,
+                // which the next frame's copy has.
+                if !first {
+                    l.ResourceBarrier(&[crate::host::transition(
+                        &reads.marks,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                }
+                // (The slots up to the last texture's: 4 MB for all of a
+                // heap of a million.)
+                let end = self.texture_end.load(Relaxed).clamp(1, reads.dwords);
+                l.CopyBufferRegion(&reads.copy, 0, &reads.marks, 0, u64::from(end) * 4);
+                l.ResourceBarrier(&[crate::host::transition(
+                    &reads.marks,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+            }
+            list.keep(&reads.copy);
+        }
+        Some(reads.gpu)
+    }
+
+    /// The read stamp of title slot `index` as last copied for the CPU (the
+    /// frame plus one in which a shader last picked a texture there; 0:
+    /// never, or no marks).
+    pub(crate) fn read_stamp(&self, index: u32) -> u32 {
+        match self.reads.get() {
+            // SAFETY: inside the copy's mapping.
+            Some(Some(r)) if index < r.dwords => unsafe { r.data.add(index as usize).read_volatile() },
+            _ => 0,
+        }
+    }
+
+    /// Whether shaders mark the texture views they pick from this heap: if
+    /// not, nothing says which are drawn, and none is let go.
+    fn reads_live(&self) -> bool {
+        matches!(self.reads.get(), Some(Some(_))) && let_go()
+    }
+
+    /// The pass made a host copy of title slot `index`'s texture (title
+    /// resource `resource`): held until no shader picks it for a while.
+    pub(crate) fn texture_slot_held(&self, index: u32, resource: usize) {
+        if !self.reads_live() {
+            return;
+        }
+        let stamp = self.read_stamp(index);
+        let (frame, ms) = (crate::frame::current(), crate::host::now_ms());
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        textures.held_now(index, stamp, frame, ms, resource);
+    }
+
+    /// The pass found title slot `index` holds no texture the title fills
+    /// (a render target, say): not held.
+    pub(crate) fn texture_slot_not_held(&self, index: u32) {
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        textures.held.remove(&index);
+    }
+
+    /// Residency of textures picked by index, once a frame before the pass
+    /// serves the queue: slots let go that a shader picked since are due
+    /// again; with `short` (the card's memory is short:
+    /// `crate::resource::short`), held slots no shader picked for `idle` are
+    /// let go (their host slot made null, so that
+    /// `crate::resource::let_go_idle` lets go of the host copy once nothing
+    /// else holds it); with `full` (the card has no room), due slots no
+    /// shader picked since their write are let go too. Nothing is let go
+    /// while shaders do not mark what they pick. Returns the slots let go,
+    /// those let go while due, and those made due again.
+    /// shortcut: a slot let go that a shader picks again is null for the
+    /// frames its mark takes to be seen and its texture to be made (two to
+    /// four).
+    pub(crate) fn texture_residency(&self, frame: u64, short: bool, full: bool, idle: Idle) -> [u64; 3] {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.reads_live() {
+            return [0; 3];
+        }
+        let ms = crate::host::now_ms();
+        let stamp = |i: u32| self.read_stamp(i);
+        let (unread, back, waiting) = {
+            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            let back = textures.revive(frame, stamp);
+            // (Every frame, for the stamps it follows.)
+            let mut unread = textures.unread(frame, ms, idle, stamp);
+            if !short {
+                unread.clear();
+            }
+            let waiting = if full { textures.park_waiting(frame, idle, stamp) } else { Vec::new() };
+            (unread, back, waiting)
+        };
+        // Under `made`'s lock alone (the queue's is not taken under it).
+        let (mut gone, mut kept_on) = (Vec::new(), Vec::new());
+        {
+            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            for &(index, stamp, resource) in &unread {
+                // A table's slot is the draws'; a texture the host copied
+                // into holds what title memory does not.
+                if self.tabled_lately(index, frame) || crate::texture::host_wrote(resource) {
+                    kept_on.push(index);
+                    continue;
+                }
+                let key = made.get(index as usize).copied().unwrap_or(0);
+                if key != 0 {
+                    // Only a slot that still shows a texture the title fills.
+                    let shows = view_at(key as u32, (key >> 32) as u32);
+                    if shows.as_ref().is_some_and(|v| !title_filled(v)) {
+                        kept_on.push(index);
+                        continue;
+                    }
+                    self.unmake(&mut made, index);
+                }
+                gone.push((index, stamp));
+            }
+        }
+        {
+            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            for &(index, stamp) in &gone {
+                textures.park(index, stamp);
+            }
+            for index in kept_on {
+                textures.held.remove(&index);
+            }
+        }
+        let counts = [gone.len() as u64, waiting.len() as u64, back.len() as u64];
+        for (total, n) in RESIDENCY.iter().zip(counts) {
+            total.fetch_add(n, Relaxed);
+        }
+        counts
+    }
+
+    /// For the frame line: title slots whose texture's host copy is held
+    /// for shaders that pick it by index, and slots let go.
+    pub(crate) fn texture_residency_counts(&self) -> [u64; 2] {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).residency()
     }
 
     /// The texture view of title slot `index` (as handed out with `write`)
@@ -909,7 +1351,7 @@ impl HostHeap {
             stamp.store(now | TABLED_READ, Relaxed);
             if tabled_out() {
                 let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-                if textures.slots.remove(&index).is_some() {
+                if textures.remove(index) {
                     TABLED_WRITES[1].fetch_add(1, Relaxed);
                 }
             }
@@ -936,6 +1378,9 @@ impl HostHeap {
     /// `texture`, whether it now holds a view of a texture the title may
     /// fill; `seen` as for [`HostHeap::note_buffer`].
     fn queue_texture(&self, index: u32, texture: bool, seen: bool, frame: u64) {
+        if texture {
+            self.texture_end.fetch_max(index + 1, std::sync::atomic::Ordering::Relaxed);
+        }
         let stamp = if tabled_out() { self.tabled_stamp(index) } else { 0 };
         let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
         // A table's slot lately: the draw that reads it uploads its
@@ -2454,6 +2899,158 @@ mod tests {
         // Long after the last table, a write is due at once.
         heap.queue_texture(2, true, false, frame + 3 + TABLED_FRAMES);
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
+    }
+
+    /// Read stamps by slot, for the queue's residency.
+    fn stamps(pairs: &[(u32, u32)]) -> impl Fn(u32) -> u32 + '_ {
+        move |i| pairs.iter().find(|p| p.0 == i).map_or(0, |p| p.1)
+    }
+
+    /// A held slot no shader picks for the idle frames and time is handed
+    /// out to be let go; a stamp that moves starts the time anew. A slot let
+    /// go leaves the queue, stays out when its memory changes, and comes
+    /// back ahead of the others when a shader picks it again. Nothing is
+    /// handed out while no held slot shows a recent mark.
+    #[test]
+    fn textures_no_shader_picks_are_let_go_until_one_does() {
+        let idle = Idle { frames: 32, ms: 10_000 };
+        let mut q = TextureQueue::default();
+        q.held_now(5, 0, 100, 0, 0x5000);
+        q.held_now(6, 0, 100, 0, 0x6000);
+        q.held_now(7, 0, 100, 0, 0x7000);
+        // Slot 7 is picked in every frame (its stamp: the frame plus one);
+        // slot 6 in frame `six - 1` if `six` is not 0.
+        let at = |frame: u64, six: u32| {
+            move |i: u32| match i {
+                6 => six,
+                7 => frame as u32 + 1,
+                _ => 0,
+            }
+        };
+        assert_eq!(q.unread(120, 20_000, idle, at(120, 0)), [], "not enough frames");
+        assert_eq!(q.unread(140, 5_000, idle, at(140, 0)), [], "not long enough");
+        // A shader picked slot 6 in frame 124 (stamp 125).
+        assert_eq!(q.unread(140, 12_000, idle, at(140, 125)), [(5, 0, 0x5000)]);
+        assert_eq!(q.unread(171, 21_000, idle, at(171, 125)), [(5, 0, 0x5000)]);
+        assert_eq!(q.unread(172, 22_000, idle, at(172, 125)), [(5, 0, 0x5000), (6, 125, 0x6000)]);
+        q.park(5, 0);
+        assert_eq!(q.residency(), [2, 1]);
+        // Its memory remapped: still let go, not due.
+        q.changed(5, 173, 174);
+        assert!(q.due(u64::MAX, 100).is_empty());
+        assert_eq!(q.revive(175, |_| 0), [] as [u32; 0]);
+        // Picked again in frame 175: due at once, ahead of a slot written later.
+        let picked = [(5, 176)];
+        assert_eq!(q.revive(177, stamps(&picked)), [5]);
+        q.written(9, 177, 0, false);
+        let order: Vec<u32> = q.due_by(177, 100, stamps(&picked)).into_iter().map(|d| d.0).collect();
+        assert_eq!(order, [5, 9]);
+        // Made again: held, and no longer let go.
+        q.held_now(5, 176, 178, 30_000, 0x5000);
+        assert_eq!(q.residency(), [3, 0]);
+        // A slot a draw reads through a table is no longer the queue's.
+        assert!(!q.remove(6));
+        assert!(q.remove(9));
+        assert_eq!(q.residency(), [2, 0]);
+        // Long after: no mark of the last frames anywhere (the copy for the
+        // CPU stopped, say), so no slot looks more unread than the others.
+        let stale = |i: u32| match i {
+            5 => 176,
+            7 => 173,
+            _ => 0,
+        };
+        assert_eq!(q.unread(1000, 100_000, idle, stale), []);
+        // Slot 7 picked again: slot 5 is let go.
+        let fresh = |i: u32| if i == 7 { 1001 } else { stale(i) };
+        assert_eq!(q.unread(1001, 100_000, idle, fresh), [(5, 176, 0x5000)]);
+    }
+
+    /// With the card full, due slots no shader picked since their write
+    /// are let go once they waited the idle frames; picked ones are served
+    /// first and stay, as do slots uploaded in part and held ones. The
+    /// title writing a slot let go makes it due again.
+    #[test]
+    fn due_slots_no_shader_picks_give_way_when_the_card_is_full() {
+        let idle = Idle { frames: 32, ms: 0 };
+        let mut q = TextureQueue::default();
+        for slot in 1..=4 {
+            q.written(slot, 10, 0, false);
+        }
+        // Slot 2 was picked in frame 10, slot 3 in frame 9 (before its write).
+        let picked = [(2, 11), (3, 10)];
+        let order: Vec<u32> = q.due_by(10, 100, stamps(&picked)).into_iter().map(|d| d.0).collect();
+        assert_eq!(order[0], 2);
+        assert_eq!(q.park_waiting(41, idle, stamps(&picked)), [] as [u32; 0]);
+        // Slot 4 is uploaded in part, slot 3 held.
+        let w4 = q.due(u64::MAX, 100).iter().find(|d| d.0 == 4).unwrap().1;
+        q.partly(4, w4, 0, 4096);
+        q.held_now(3, 10, 12, 0, 0x3000);
+        assert_eq!(q.park_waiting(42, idle, stamps(&picked)), [1]);
+        let mut left: Vec<u32> = q.due(u64::MAX, 100).into_iter().map(|d| d.0).collect();
+        left.sort_unstable();
+        assert_eq!(left, [2, 3, 4]);
+        assert_eq!(q.residency(), [1, 1]);
+        q.written(1, 50, 0, false);
+        assert_eq!(q.residency(), [1, 0]);
+        assert!(q.due(50, 100).iter().any(|d| d.0 == 1));
+        assert!(read_since(11, 10) && !read_since(10, 10) && !read_since(0, 0));
+    }
+
+    /// The heap lets go of a held slot no shader picked, when the card's
+    /// memory is short: its host slot is made null and lets go of the
+    /// resource it held; a table's slot stays. Nothing is let go while
+    /// shaders do not mark what they pick, nor while the card has memory to
+    /// spare.
+    #[test]
+    fn a_slot_let_go_no_longer_holds_its_texture() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let Some(texture) = host().and_then(|h| h.uav_buffer(256)) else {
+            return;
+        };
+        let now = Idle { frames: 2, ms: 0 };
+        let hold = |index: u32| {
+            heap.made.lock().unwrap()[index as usize] = 1 << 32 | 0x7fff_fff0;
+            heap.keep(index, Some(texture.clone()));
+            let mut textures = heap.textures.lock().unwrap();
+            textures.held_now(index, 0, 100, 0, 0);
+        };
+        hold(3);
+        assert_eq!(heap.texture_residency(200, true, false, now), [0; 3], "no marks yet");
+        assert!(heap.kept.lock().unwrap()[3].is_some());
+        let Some(reads) = heap.reads.get_or_init(|| Reads::new(heap.count)).as_ref() else {
+            return;
+        };
+        hold(4);
+        heap.tabled_in(4, true, 199);
+        heap.textures.lock().unwrap().held_now(4, 0, 100, 0, 0);
+        // Slot 5 is picked in frame 199 (its stamp as the copy for the CPU
+        // shows it).
+        hold(5);
+        // SAFETY: inside the copy's mapping; nothing else writes it here.
+        unsafe { r_write(reads, 5, 200) };
+        assert_eq!(heap.texture_residency(200, false, false, now), [0; 3], "memory to spare");
+        assert!(heap.kept.lock().unwrap()[3].is_some());
+        assert_eq!(heap.texture_residency(200, true, false, now), [1, 0, 0]);
+        assert_eq!(heap.made.lock().unwrap()[3], 0);
+        assert!(heap.kept.lock().unwrap()[3].is_none());
+        assert!(heap.kept.lock().unwrap()[4].is_some(), "a table's slot");
+        assert!(heap.kept.lock().unwrap()[5].is_some(), "a slot a shader picks");
+        assert_eq!(heap.texture_residency_counts(), [1, 1]);
+        // A shader picks slot 3: due again, first.
+        // SAFETY: as above.
+        unsafe { r_write(reads, 3, 201) };
+        assert_eq!(heap.read_stamp(3), 201);
+        assert_eq!(heap.texture_residency(202, true, false, now), [0, 0, 1]);
+        assert_eq!(heap.texture_slots_due(202, 8).0.first().map(|d| d.0), Some(3));
+    }
+
+    /// Writes stamp `value` at `index` of the marks' copy, as the card's
+    /// copy would.
+    unsafe fn r_write(reads: &Reads, index: usize, value: u32) {
+        // SAFETY: the caller's.
+        unsafe { reads.data.cast_mut().add(index).write_volatile(value) };
     }
 
     #[test]

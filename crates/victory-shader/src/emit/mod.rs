@@ -90,6 +90,8 @@ mod intersect_tests;
 pub mod host;
 mod lower;
 mod own_bits;
+#[cfg(all(test, windows))]
+mod reads_tests;
 mod rect;
 mod sampler;
 mod shader;
@@ -113,9 +115,9 @@ pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    set_view_heap_limit,
+    MEMORY_FAULTS, MEMORY_PAGES, READS_COUNT, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY,
+    SLOT_READS, SLOT_STRIDES, SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_FRAME, USER_MEMORY_BASE,
+    USER_VIEW_ADDRESS, USER_VIEW_BIAS, set_view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -166,6 +168,16 @@ pub fn group_sync() -> u8 {
         Some("1") => 1,
         _ => 2,
     })
+}
+
+/// Whether translated shaders mark the view heap slots whose texture views
+/// they pick by an index they compute (`SLOT_READS`), so that the host can
+/// let go of the host copies of textures no shader draws.
+/// `VICTORY_HEAP_READS=0`: they do not, and the host keeps every copy it
+/// made for such slots, as before.
+pub fn heap_reads() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_READS").is_none_or(|v| v != "0"))
 }
 
 /// The clean-up passes that run over a translated program before it is

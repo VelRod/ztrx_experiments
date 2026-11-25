@@ -6124,9 +6124,7 @@ impl<'a> Lower<'a> {
                 // A waterfall loop's load at the first lane's offset reads
                 // each lane's own entry (see `resource::Waterfall`).
                 let per_lane = self.x.res.waterfall.loads.contains(load);
-                let h = self
-                    .s
-                    .heap_handle(self.cur, index, sampler, per_lane, props);
+                let h = self.heap_view(src, index, sampler, per_lane, props);
                 self.handles.insert(key, h);
                 Ok(h)
             }
@@ -6187,7 +6185,7 @@ impl<'a> Lower<'a> {
             Source::Phi { block, args } => {
                 let _ = site;
                 let phi = self.descriptor_phi(*block, args, sampler, 8)?;
-                Ok(self.s.heap_handle(self.cur, phi, sampler, false, props))
+                Ok(self.heap_view(src, phi, sampler, false, props))
             }
             Source::Select { scc, args } => {
                 // The heap index of each choice, picked by SCC (uniform).
@@ -6205,16 +6203,76 @@ impl<'a> Lower<'a> {
                 let set = self.heap_index(a, fa, sampler)?;
                 let clear = self.heap_index(b, fb, sampler)?;
                 let index = self.s.m.select(self.cur, cond, set, clear);
-                Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
+                Ok(self.heap_view(src, index, sampler, false, props))
             }
             Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => {
                 // A descriptor each lane has its own of (a waterfall loop
                 // reads it from the first active lane): each lane's heap
                 // index, non-uniform.
                 let index = self.lane_heap_index(src, sampler)?;
-                Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
+                Ok(self.heap_view(src, index, sampler, true, props))
             }
         }
+    }
+
+    /// The heap handle of the descriptor `src` at heap slot `index`
+    /// (`Shader::heap_handle`), and for a texture view the program picks
+    /// from the view heap at an index it computes, its read mark.
+    fn heap_view(&mut self, src: &Source, index: V, sampler: bool, nonuniform: bool, props: (u32, u32)) -> V {
+        let h = self.s.heap_handle(self.cur, index, sampler, nonuniform, props);
+        // Resource kinds 1 to 9 are textures; bit 12 an unordered access
+        // view (the host's own textures: nothing to let go).
+        let texture = matches!(props.0 & 0xFF, 1..=9) && props.0 & 0x1000 == 0;
+        if !sampler && texture && super::heap_reads() && self.picked(src) {
+            self.mark_read(index);
+        }
+        h
+    }
+
+    /// Whether the descriptor `src` is one the program picks from the view
+    /// heap at an index it computes (root type `ResourceHeap`), whichever
+    /// way control flow or lanes choose it. Views read through tables are
+    /// not: the host makes those ready for the draw that names the table,
+    /// and knows them.
+    fn picked(&self, src: &Source) -> bool {
+        src.leaves().into_iter().any(|leaf| match leaf {
+            Source::Loaded { load, .. } | Source::Fetched { load, .. } => self
+                .scalar
+                .get(load)
+                .and_then(|a| self.x.native.layout.get(a.param))
+                .is_some_and(|p| p.root == RootType::ResourceHeap),
+            _ => false,
+        })
+    }
+
+    /// Stores the stamp of the frame the draw is recorded in at view heap
+    /// slot `index` of the read marks (`shader.rs` `SLOT_READS`), in the
+    /// current block: lanes of one wave store the same stamp at the same
+    /// place, one write. Lanes that do not run may mark too: a mark too
+    /// many keeps a texture a little longer, one too few would let go of a
+    /// texture that is drawn.
+    fn mark_read(&mut self, index: V) {
+        use super::shader::{READS_COUNT, SLOT_READS, USER_FRAME};
+        let stamp = self.host_word(RootType::Other(USER_FRAME), 0, 0);
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        // Inside the buffer whatever the index: a root view has no bounds.
+        let last = self.s.m.i32(READS_COUNT - 1);
+        let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last]);
+        self.s.m.tag(slot, Tag::Clamp);
+        let two = self.s.m.i32(2);
+        let byte = self.s.m.bin(c, Bin::Shl, slot, two);
+        let h = self.s.root_uav_handle(SLOT_READS);
+        let iu = self.s.m.undef(i32t);
+        let (mask, align, void) = (self.s.m.i8(1), self.s.m.i32(4), self.s.t.void);
+        self.s.op(
+            c,
+            "rawBufferStore.i32",
+            Attr::NoUnwind,
+            void,
+            140,
+            &[h, byte, iu, stamp, iu, iu, iu, mask, align],
+        );
     }
 
     /// The heap index a descriptor phi picks. Each predecessor computes its

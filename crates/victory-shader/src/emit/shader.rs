@@ -70,12 +70,34 @@ pub const USER_VIEW_ADDRESS: u32 = 0x101;
 /// a spilled user-data table.
 pub const USER_VIEW_BIAS: u32 = 0x103;
 
+/// The root UAV `u<SLOT_READS>` in [`ROOT_CBV_SPACE`] of a shader that picks
+/// texture views from the view heap at an index it computes (root type
+/// `ResourceHeap`): a raw buffer of [`READS_COUNT`] dwords, dword `i` the
+/// stamp of the last frame in which a shader picked a texture at view heap
+/// slot `i` (0: none since the buffer was made). The shader stores the
+/// user-data dword of kind [`USER_FRAME`] there each time it makes such a
+/// handle (indices past the buffer are clamped to its last dword). Nothing
+/// else tells the host which of the heap's tens of thousands of texture
+/// views are drawn: the host lets go of the host copies of those no shader
+/// has picked for a while, and makes them again when one does.
+pub const SLOT_READS: u8 = 252;
+/// Dwords of the [`SLOT_READS`] buffer.
+pub const READS_COUNT: u32 = 1 << 21;
+/// `RootType::Other` code of a user-data dword the host computes: the stamp
+/// of the frame the draw is recorded in, never 0 ([`SLOT_READS`]).
+pub const USER_FRAME: u32 = 0x104;
+
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const DOUBLES: u64 = 1 << 2;
+    /// `[earlydepthstencil]`: the depth and stencil tests run before the
+    /// pixel shader whatever it writes to unordered access views.
+    pub const EARLY_DEPTH: u64 = 1 << 3;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
+    /// Unordered access views in a stage other than pixel and compute.
+    pub const UAVS_EVERY_STAGE: u64 = 1 << 16;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const BARYCENTRICS: u64 = 1 << 22;
     pub const INT64: u64 = 1 << 20;
@@ -152,6 +174,11 @@ pub(crate) struct Shader {
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
+    /// Heap handles of unordered access views (the title's, or title
+    /// memory by address).
+    heap_uavs: u32,
+    /// A pixel shader that discards (a `dx.op.discard` was made).
+    discards: bool,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -208,6 +235,8 @@ impl Shader {
             root_uavs: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
+            heap_uavs: 0,
+            discards: false,
             threads: None,
             wave_size: None,
             lds_dwords: 0,
@@ -239,6 +268,7 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
+        self.discards |= name == "discard";
         let mut params = vec![self.t.i32];
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);
@@ -426,6 +456,7 @@ impl Shader {
             flags::RESOURCE_HEAP
         };
         self.nonuniform_handles += u32::from(nonuniform);
+        self.heap_uavs += u32::from(!sampler && props.0 & 0x1000 != 0);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,
@@ -687,6 +718,15 @@ impl Shader {
         if self.pixel && self.outputs.iter().any(|o| o.kind == 20) {
             self.flags |= flags::STENCIL_REF;
         }
+        let graphics_stage = self.threads.is_none() || self.mesh.is_some();
+        if self.pixel && graphics_stage && self.early_depth() {
+            self.flags |= flags::EARLY_DEPTH;
+        }
+        // Unordered access views in a vertex, geometry or mesh shader (the
+        // ones declared: heap handles do not count).
+        if !self.pixel && graphics_stage && !self.root_uavs.is_empty() {
+            self.flags |= flags::UAVS_EVERY_STAGE;
+        }
         // Entry properties: shader flags (tag 0), geometry state (1),
         // thread-group size (4), wave size (11).
         let mut props = Vec::new();
@@ -783,6 +823,9 @@ impl Shader {
         if self.flags & flags::DOUBLES != 0 {
             features |= 0x1;
         }
+        if self.flags & flags::UAVS_EVERY_STAGE != 0 {
+            features |= 0x4;
+        }
         if self.flags & flags::WAVE_OPS != 0 {
             features |= 0x4000;
         }
@@ -835,6 +878,21 @@ impl Shader {
         container::build(&parts)
     }
 
+    /// Whether a pixel shader runs after the depth and stencil tests: one
+    /// whose only stores to unordered access views are our read marks
+    /// ([`SLOT_READS`]) and that does nothing on which the depth it writes
+    /// depends (no discard, no depth, stencil or coverage output). Such
+    /// stores make the tests run after the shader, on every hidden pixel
+    /// too (their stores must be seen), which for these marks alone is no
+    /// use: the shader draws the same with the tests first.
+    fn early_depth(&self) -> bool {
+        let marks = self.root_uavs.iter().any(|r| r.0 == SLOT_READS);
+        let others = self.root_uavs.iter().any(|r| r.0 != SLOT_READS) || self.heap_uavs > 0;
+        // Coverage, depth (three kinds) and stencil reference outputs.
+        let decides = self.outputs.iter().any(|o| matches!(o.kind, 14 | 17..=20));
+        marks && !others && !self.discards && !decides
+    }
+
     /// The user-data buffer's annotation carries its size, known only now.
     fn fix_user_data_size(&mut self, size: u32) {
         let old = [self.m.i32(13), self.m.i32(u32::MAX)];
@@ -882,5 +940,101 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn output(kind: u8) -> SigElement {
+        SigElement {
+            name: "out".into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 1,
+            usage: 1,
+            half: false,
+        }
+    }
+
+    /// A pixel shader whose only stores are its read marks keeps the depth
+    /// and stencil tests ahead of it; one that discards, writes depth,
+    /// stencil or coverage, or stores anything else does not, nor does one
+    /// without marks (nothing to keep them ahead for).
+    #[test]
+    fn read_marks_alone_keep_the_depth_tests_ahead() {
+        let marked = || {
+            let mut s = Shader::new(true);
+            s.root_uav_handle(SLOT_READS);
+            s.outputs.push(output(16));
+            s
+        };
+        assert!(marked().early_depth());
+        assert!(!Shader::new(true).early_depth());
+        let mut s = marked();
+        let t = s.m.bool(true);
+        let block = s.entry;
+        let void = s.t.void;
+        s.op(block, "discard", Attr::NoUnwind, void, 82, &[t]);
+        assert!(!s.early_depth(), "it discards");
+        for kind in [14, 17, 18, 19, 20] {
+            let mut s = marked();
+            s.outputs.push(output(kind));
+            assert!(!s.early_depth(), "output kind {kind}");
+        }
+        let mut s = marked();
+        s.root_uav_handle(3);
+        assert!(!s.early_depth(), "a title root UAV");
+        let mut s = marked();
+        let zero = s.m.i32(0);
+        let block = s.entry;
+        s.heap_handle(block, zero, false, false, (11 | 0x1000, 0));
+        assert!(!s.early_depth(), "a heap UAV");
+    }
+
+    /// A vertex or mesh shader that stores its read marks declares
+    /// unordered access views in a stage other than pixel and compute, as
+    /// the validator computes it.
+    #[cfg(windows)]
+    #[test]
+    fn marks_in_a_vertex_or_mesh_shader_declare_uavs_at_every_stage() {
+        let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) else {
+            eprintln!("no dxil.dll; skipped");
+            return;
+        };
+        for mesh in [false, true] {
+            let mut s = Shader::new(false);
+            if mesh {
+                s.threads = Some([32, 1, 1]);
+                s.mesh = Some(Mesh {
+                    max_vertices: 0,
+                    max_primitives: 0,
+                    topology: 2,
+                });
+            }
+            let h = s.root_uav_handle(SLOT_READS);
+            let block = s.entry;
+            let (i32t, void) = (s.t.i32, s.t.void);
+            let (at, value, iu) = (s.m.i32(8), s.m.i32(7), s.m.undef(i32t));
+            let (mask, align) = (s.m.i8(1), s.m.i32(4));
+            s.op(
+                block,
+                "rawBufferStore.i32",
+                Attr::NoUnwind,
+                void,
+                140,
+                &[h, at, iu, value, iu, iu, iu, mask, align],
+            );
+            s.m.terminate(block, super::super::bitcode::Term::Ret);
+            let mut dxil = s.finish();
+            v.validate(&mut dxil).unwrap_or_else(|e| panic!("mesh {mesh}: {e}"));
+        }
     }
 }

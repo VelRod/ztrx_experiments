@@ -1623,6 +1623,21 @@ pub(crate) fn room() -> bool {
     }
 }
 
+/// Whether the card's memory is short enough that host copies of textures
+/// no shader picked lately are let go
+/// (`descriptor::host::HostHeap::texture_residency`): this process uses four
+/// fifths of the budget the system gives it or more. Below that a copy
+/// kept costs nothing, and one let go is null for the frames its texture
+/// takes to be made again when a shader picks it. True when the budget is
+/// not known.
+#[cfg(windows)]
+pub(crate) fn short() -> bool {
+    match crate::host::host().and_then(|h| h.video_memory()) {
+        Some([budget, used, ..]) => used >= budget / 5 * 4,
+        None => true,
+    }
+}
+
 /// `VICTORY_TEXTURE_MARGIN_MB`: what [`room`] leaves free of the card's
 /// budget, in place of a tenth of it. The card fills to about 94 % of its
 /// budget all the same (targets and buffer copies are made past the rule),
