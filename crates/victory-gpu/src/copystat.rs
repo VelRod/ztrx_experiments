@@ -738,6 +738,38 @@ fn log_memory() {
         mb(card[0]),
         mb(card[3]),
     );
+    {
+        let aliasing = crate::resource::aliasing();
+        let part = |a: &[u64; 8]| {
+            format!(
+                "{} textures {:.0} MB on the card ({:.0} MB if those the host allows were placed at 4 KiB), {} of them \
+                 over another's title memory ({:.0} MB on the card, {:.0} MB if each such group shared its largest \
+                 member's memory), title memory covered {:.0} MB of {:.0} MB of footprints",
+                a[0],
+                mb(a[1]),
+                mb(a[7]),
+                a[2],
+                mb(a[3]),
+                mb(a[4]),
+                mb(a[5]),
+                mb(a[6])
+            )
+        };
+        let small = crate::resource::small_texture_stats();
+        tracing::info!(
+            "textures sharing title memory: those the host renders to or writes: {}; those the title fills: {}; all \
+             together: {}; small textures placed at 4 KiB: {} alive {:.0} MB in {} heaps {:.0} MB, {} gone waiting \
+             for their last holder",
+            part(&aliasing[0]),
+            part(&aliasing[1]),
+            part(&aliasing[2]),
+            small[0],
+            mb(small[1]),
+            small[2],
+            mb(small[3]),
+            small[4]
+        );
+    }
     tracing::info!(
         "memory let go since the start: {} windows outside buffers {:.0} MB, {} staging buffers \
          {:.0} MB; of the windows alive, {:.0} MB lie between the lowest and highest address \
