@@ -1125,7 +1125,242 @@ pub(crate) struct HostTexture {
     /// Whether its contents come from title memory ([`fills`]): counted in
     /// [`KINDS`] while it lives.
     filled: bool,
+    /// The bytes it would take placed in a heap at the small alignment
+    /// (4 KiB) where the host allows that, else `bytes` (diagnostics: what
+    /// committed textures' 64 KiB granularity costs, [`aliasing`]).
+    #[cfg(feature = "diagnostics")]
+    small: u64,
+    /// Where it lies if it is placed in a heap of small textures
+    /// ([`small`]): given back to the pool when it goes.
+    slot: Option<small::Slot>,
 }
+
+/// Host copies of small textures the title fills, placed at the small
+/// alignment (4 KiB) in heaps of their own, not committed: a committed
+/// texture takes a multiple of 64 KiB, and the title's textures took 5,265
+/// MB on an RTX 5070 where 4,508 MB would have held them at 4 KiB (the
+/// prologue, 16,341 textures), while thousands of others waited for room on
+/// the card. `VICTORY_SMALL_TEXTURES=0`: all committed, as before.
+///
+/// A heap holds slots of one size, in 4 KiB steps. A slot goes back to the
+/// pool once nothing holds its texture any more: a descriptor slot may still
+/// name a host texture after its host copy has gone (a committed texture's
+/// memory lived as long as that), so the texture waits in the pool and
+/// [`small::collect`], once a second before a submission, lets go of those
+/// only the pool holds.
+#[cfg(windows)]
+mod small {
+    use std::sync::Mutex;
+
+    use windows::Win32::Graphics::Direct3D12::*;
+
+    /// The alignment and the step of slot sizes.
+    const STEP: u64 = D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT as u64;
+    /// The bytes of a heap.
+    const HEAP: u64 = 2 << 20;
+    /// The largest texture placed so; bigger ones are committed.
+    const MOST: u64 = 256 << 10;
+
+    /// Where a texture lies: its size class (in steps, less one), heap and
+    /// offset in it.
+    pub(super) struct Slot {
+        class: usize,
+        heap: usize,
+        offset: u64,
+    }
+
+    #[derive(Default)]
+    struct Class {
+        heaps: Vec<ID3D12Heap>,
+        free: Vec<(usize, u64)>,
+    }
+
+    struct Pool {
+        classes: Vec<Class>,
+        /// Textures whose host copy has gone, held until nothing else
+        /// holds them.
+        waiting: Vec<(ID3D12Resource, Slot)>,
+        /// Slots in use and their bytes.
+        used: [u64; 2],
+    }
+
+    // SAFETY: D3D12 objects (free-threaded) behind a lock.
+    unsafe impl Send for Pool {}
+
+    static POOL: Mutex<Pool> = Mutex::new(Pool { classes: Vec::new(), waiting: Vec::new(), used: [0; 2] });
+
+    fn pool() -> std::sync::MutexGuard<'static, Pool> {
+        POOL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(super) fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_SMALL_TEXTURES").is_none_or(|v| v != "0"))
+    }
+
+    /// A texture described by `desc` (the host's description, any
+    /// alignment) placed in a heap of small textures in `state`, if the
+    /// host allows the small alignment for it and it is small enough.
+    pub(super) fn place(
+        device: &ID3D12Device,
+        desc: &D3D12_RESOURCE_DESC,
+        state: D3D12_RESOURCE_STATES,
+    ) -> Option<(ID3D12Resource, Slot)> {
+        let mut desc = *desc;
+        desc.Alignment = STEP;
+        // SAFETY: a plain query.
+        let info = unsafe { device.GetResourceAllocationInfo(0, &[desc]) };
+        if info.Alignment != STEP || info.SizeInBytes == 0 || info.SizeInBytes > MOST {
+            return None;
+        }
+        let class = (info.SizeInBytes.div_ceil(STEP) - 1) as usize;
+        let size = (class as u64 + 1) * STEP;
+        let (heap, slot) = {
+            let mut pool = pool();
+            if pool.classes.len() <= class {
+                pool.classes.resize_with(class + 1, Class::default);
+            }
+            let c = &mut pool.classes[class];
+            if c.free.is_empty() {
+                let made: Option<ID3D12Heap> = {
+                    let mut heap = None;
+                    // SAFETY: plain creation of a heap for textures only.
+                    let ok = unsafe {
+                        device.CreateHeap(
+                            &D3D12_HEAP_DESC {
+                                SizeInBytes: HEAP,
+                                Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                                Alignment: 0,
+                                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
+                            },
+                            &mut heap,
+                        )
+                    };
+                    ok.ok().and(heap)
+                };
+                let heap = made?;
+                crate::host::name(&heap, || format!("small textures of {size} bytes"));
+                let index = c.heaps.len();
+                c.heaps.push(heap);
+                c.free.extend((0..HEAP / size).rev().map(|i| (index, i * size)));
+            }
+            let (heap, offset) = c.free.pop()?;
+            let found = c.heaps[heap].clone();
+            pool.used[0] += 1;
+            pool.used[1] += size;
+            (found, Slot { class, heap, offset })
+        };
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: a heap of ours with room for the texture at `offset`,
+        // which no live resource uses.
+        let made = unsafe { device.CreatePlacedResource(&heap, slot.offset, &desc, state, None, &mut texture) };
+        match (made, texture) {
+            (Ok(()), Some(texture)) => Some((texture, slot)),
+            _ => {
+                give_back(slot);
+                None
+            }
+        }
+    }
+
+    fn give_back(slot: Slot) {
+        let mut pool = pool();
+        pool.used[0] -= 1;
+        pool.used[1] -= (slot.class as u64 + 1) * STEP;
+        pool.classes[slot.class].free.push((slot.heap, slot.offset));
+    }
+
+    /// The host copy placed in `slot` has gone: its slot is free once
+    /// nothing holds `texture` any more ([`collect`]).
+    pub(super) fn release(texture: ID3D12Resource, slot: Slot) {
+        pool().waiting.push((texture, slot));
+    }
+
+    /// Frees the slots of textures only the pool holds now.
+    pub(super) fn collect() {
+        let gone: Vec<(ID3D12Resource, Slot)> = {
+            let mut pool = pool();
+            let (gone, kept): (Vec<_>, Vec<_>) =
+                std::mem::take(&mut pool.waiting).into_iter().partition(|(t, _)| crate::host::references(t) == 1);
+            pool.waiting = kept;
+            gone
+        };
+        for (texture, slot) in gone {
+            // The texture first: its memory is free when it is.
+            drop(texture);
+            give_back(slot);
+        }
+    }
+
+    /// For the memory line: textures placed so and their bytes, heaps and
+    /// their bytes, textures waiting for their last holder.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn stats() -> [u64; 5] {
+        let pool = pool();
+        let heaps: u64 = pool.classes.iter().map(|c| c.heaps.len() as u64).sum();
+        [pool.used[0], pool.used[1], heaps, heaps * HEAP, pool.waiting.len() as u64]
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+
+        fn texture(width: u64, height: u32, flags: D3D12_RESOURCE_FLAGS) -> D3D12_RESOURCE_DESC {
+            D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: width,
+                Height: height,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: flags,
+                ..Default::default()
+            }
+        }
+
+        /// Two small textures of one size share a heap at different
+        /// offsets; a slot comes back only once nothing but the pool holds
+        /// its texture (a descriptor slot may hold it after its host copy
+        /// has gone); a render target is never placed so.
+        #[test]
+        fn small_textures_share_heaps_and_slots_wait_for_their_last_holder() {
+            let Some(host) = crate::host::host() else {
+                return;
+            };
+            // 120x120 RGBA8, 56.25 KiB: a size no other test asks for.
+            let desc = texture(120, 120, D3D12_RESOURCE_FLAG_NONE);
+            let common = D3D12_RESOURCE_STATE_COMMON;
+            let (Some((a, slot_a)), Some((b, slot_b))) =
+                (place(&host.device, &desc, common), place(&host.device, &desc, common))
+            else {
+                // The host refused the small alignment: nothing to check.
+                return;
+            };
+            assert_eq!(slot_a.class, slot_b.class);
+            assert_ne!((slot_a.heap, slot_a.offset), (slot_b.heap, slot_b.offset));
+            let (class, at) = (slot_a.class, (slot_a.heap, slot_a.offset));
+            let free = |at: (usize, u64)| pool().classes[class].free.contains(&at);
+            let waiting = |at: (usize, u64)| pool().waiting.iter().any(|(_, s)| (s.heap, s.offset) == at);
+            // As a descriptor slot would.
+            let held = a.clone();
+            release(a, slot_a);
+            collect();
+            assert!(waiting(at) && !free(at), "a texture still held keeps its slot");
+            drop(held);
+            collect();
+            assert!(!waiting(at) && free(at), "the slot is free once only the pool held the texture");
+            release(b, slot_b);
+            collect();
+            let target = texture(120, 120, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+            assert!(place(&host.device, &target, common).is_none(), "targets stay committed");
+        }
+    }
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) use small::stats as small_texture_stats;
 
 /// What a title texture has on the host: its host copy and, for a depth
 /// texture shaders also write, the colour twin.
@@ -1303,7 +1538,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             .clear
             .as_ref()
             .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
-        let Some(texture) = host_texture(&r.desc, r.host.state, clear) else {
+        let Some((texture, slot)) = host_texture(&r.desc, r.host.state, clear) else {
             r.host.refused.store(true, Relaxed);
             return None;
         };
@@ -1321,6 +1556,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         }
         let state = crate::host::legal_state(&texture, crate::host::texture_state(r.host.state));
         let mut host = HostTexture::new(texture, state);
+        host.slot = slot;
         host.filled = fills(&r.desc);
         if host.filled {
             KINDS[0].fetch_add(1, Relaxed);
@@ -1379,9 +1615,28 @@ pub(crate) fn room() -> bool {
         return true;
     }
     match crate::host::host().and_then(|h| h.video_memory()) {
-        Some([budget, used, ..]) => used < budget / 10 * 9,
+        Some([budget, used, ..]) => match margin() {
+            Some(margin) => used.saturating_add(margin) < budget,
+            None => used < budget / 10 * 9,
+        },
         None => filled < WITHOUT_BUDGET,
     }
+}
+
+/// `VICTORY_TEXTURE_MARGIN_MB`: what [`room`] leaves free of the card's
+/// budget, in place of a tenth of it. The card fills to about 94 % of its
+/// budget all the same (targets and buffer copies are made past the rule),
+/// and with 9.8 of 10.4 GB in use thousands of textures waited for room
+/// (2026-11-25, RTX 5070, prologue): a margin of a few hundred MB lets them
+/// in while staying under the budget, past which the system moves the
+/// card's memory into the PC's.
+#[cfg(windows)]
+fn margin() -> Option<u64> {
+    static MARGIN: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MARGIN.get_or_init(|| {
+        let mb = std::env::var("VICTORY_TEXTURE_MARGIN_MB").ok()?;
+        mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
+    })
 }
 
 /// Lets go of the host copies of textures the title fills that nothing
@@ -1412,6 +1667,8 @@ pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_MS: u64 = 5_000;
     const IDLE_FRAMES: u64 = 4;
+    // Small textures' slots whose texture nothing holds any more.
+    small::collect();
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
@@ -1519,11 +1776,134 @@ pub(crate) fn census() -> [u64; 10] {
     count
 }
 
+/// For the memory line: whether host copies of textures share title
+/// memory. A title places short-lived targets over one another in a heap
+/// and pays for that memory once; the host makes a texture of its own for
+/// each. Per kind (0: textures the host renders to or writes, 1: textures
+/// the title fills, 2: both together), from the title memory each texture
+/// with a host copy covers, grouped where those ranges overlap: the
+/// textures and their host bytes (twins included); of those in groups of
+/// two or more, the textures, their host bytes, and the host bytes of each
+/// such group's largest member summed (what the groups would take if they
+/// shared memory as the title's do); the title memory all the groups cover;
+/// and the sum of the textures' own footprints in title memory.
+/// Last, per kind: the host bytes if every host copy the host allows were
+/// placed in a heap at the small alignment ([`HostTexture::small`]).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn aliasing() -> [[u64; 8]; 3] {
+    // (title start, title end, host bytes, the title fills it, bytes at the
+    // small alignment)
+    let mut ranges: Vec<(u64, u64, u64, bool, u64)> = Vec::new();
+    {
+        let all = textures();
+        for &at in all.iter() {
+            // SAFETY: as in `let_go_idle`.
+            let r = unsafe { &*(at as *const Resource) };
+            let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            let Some((host, twin)) = made.as_ref() else {
+                continue;
+            };
+            let Some(size) = footprint(&r.desc).map(|f| f.size) else {
+                continue;
+            };
+            let start = r.data() as u64;
+            let twin = twin.as_ref().map_or(0, |t| t.colour.bytes);
+            ranges.push((start, start.saturating_add(size.max(1)), host.bytes + twin, host.filled, host.small + twin));
+        }
+    }
+    [0, 1, 2].map(|kind| {
+        let these = || ranges.iter().filter(|r| kind == 2 || r.3 == (kind == 1));
+        let o = overlap_groups(these().map(|r| (r.0, r.1, r.2)).collect());
+        let mut out = [0u64; 8];
+        out[..7].copy_from_slice(&o);
+        out[7] = these().map(|r| r.4).sum();
+        out
+    })
+}
+
+/// [`aliasing`]'s counts for one kind of texture, from each texture's
+/// title memory (start, end) and host bytes.
+#[cfg(any(test, all(windows, feature = "diagnostics")))]
+fn overlap_groups(mut these: Vec<(u64, u64, u64)>) -> [u64; 7] {
+    these.sort_unstable();
+    let mut o = [0u64; 7];
+    let mut i = 0;
+    while i < these.len() {
+        let first = these[i].0;
+        let (mut end, mut bytes, mut most, mut own) = (these[i].1, these[i].2, these[i].2, these[i].1 - these[i].0);
+        let mut j = i + 1;
+        while j < these.len() && these[j].0 < end {
+            end = end.max(these[j].1);
+            bytes += these[j].2;
+            most = most.max(these[j].2);
+            own += these[j].1 - these[j].0;
+            j += 1;
+        }
+        let members = (j - i) as u64;
+        o[0] += members;
+        o[1] += bytes;
+        if members > 1 {
+            o[2] += members;
+            o[3] += bytes;
+            o[4] += most;
+        }
+        o[5] += end - first;
+        o[6] += own;
+        i = j;
+    }
+    o
+}
+
+#[cfg(test)]
+mod aliasing_tests {
+    use super::overlap_groups;
+
+    /// Two targets over the same title memory and a third over part of
+    /// them form one group; a texture that only touches its end stands
+    /// alone.
+    #[test]
+    fn textures_over_the_same_title_memory_are_one_group() {
+        let o = overlap_groups(vec![
+            (0x1000, 0x5000, 40),
+            (0x1000, 0x5000, 40),
+            (0x3000, 0x7000, 50),
+            (0x7000, 0x8000, 7),
+        ]);
+        // All four, their host bytes.
+        assert_eq!((o[0], o[1]), (4, 137));
+        // Three overlap: 130 bytes on the card, 50 if they shared memory.
+        assert_eq!((o[2], o[3], o[4]), (3, 130, 50));
+        // Title memory covered 0x1000..0x8000, footprints summed.
+        assert_eq!(o[5], 0x7000);
+        assert_eq!(o[6], 0x4000 * 3 + 0x1000);
+        assert_eq!(overlap_groups(Vec::new()), [0; 7]);
+    }
+}
+
 /// Host textures alive (the title's and the twins) and the bytes the host
 /// gives them, for the memory line.
 #[cfg(windows)]
 pub(crate) static HOST_TEXTURES: [std::sync::atomic::AtomicU64; 2] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// The bytes `texture` would take placed in a heap at the small alignment
+/// (4 KiB), if the host allows that alignment for it (a texture that is no
+/// target, depth or unordered-access texture, and small enough).
+#[cfg(all(windows, feature = "diagnostics"))]
+fn small_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> Option<u64> {
+    use windows::Win32::Graphics::Direct3D12::D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT;
+    let host = crate::host::host()?;
+    // SAFETY: plain queries on a live resource and device.
+    unsafe {
+        let mut desc = texture.GetDesc();
+        if desc.Flags.0 & 0x7 != 0 {
+            return None;
+        }
+        desc.Alignment = u64::from(D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT);
+        let info = host.device.GetResourceAllocationInfo(0, &[desc]);
+        (info.Alignment == u64::from(D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT)).then_some(info.SizeInBytes)
+    }
+}
 
 /// The bytes the host allocates for `texture`.
 #[cfg(windows)]
@@ -1545,11 +1925,16 @@ impl HostTexture {
         let bytes = host_bytes(&texture);
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
+        #[cfg(feature = "diagnostics")]
+        let small = small_bytes(&texture).unwrap_or(bytes);
         HostTexture {
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
             bytes,
             filled: false,
+            #[cfg(feature = "diagnostics")]
+            small,
+            slot: None,
         }
     }
 }
@@ -1563,6 +1948,9 @@ impl Drop for HostTexture {
         if self.filled {
             KINDS[0].fetch_sub(1, Relaxed);
             KINDS[1].fetch_sub(self.bytes, Relaxed);
+        }
+        if let Some(slot) = self.slot.take() {
+            small::release(self.texture.clone(), slot);
         }
     }
 }
@@ -1615,13 +2003,15 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
 }
 
 /// A host texture like the title's: same description, in GPU memory,
-/// without the console's layout and flags.
+/// without the console's layout and flags; placed in a heap of small
+/// textures ([`small`]) where it is one the title fills and small enough,
+/// with its slot, else committed.
 #[cfg(windows)]
 fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, Option<small::Slot>)> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
@@ -1671,6 +2061,32 @@ fn host_texture(
         }
         value
     });
+    let initial = D3D12_RESOURCE_STATES(crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32);
+    let name = |t: &ID3D12Resource, placed: bool| {
+        crate::host::name(t, || {
+            format!(
+                "texture {}x{} f{} flags {:#x}{}",
+                d.width,
+                d.height,
+                d.format,
+                d.flags,
+                if placed { " (with the small textures)" } else { "" }
+            )
+        });
+    };
+    // A texture the title fills (no target, depth or unordered access, no
+    // clear value): at the small alignment if the host allows it. Its first
+    // upload writes every subresource, so what a slot held before does not
+    // show.
+    if small::on() && fills(desc) && clear_value.is_none() {
+        // SAFETY: the description has the host layout (checked size, same
+        // fields).
+        let host_desc = unsafe { (&raw const d).cast::<D3D12_RESOURCE_DESC>().read_unaligned() };
+        if let Some((texture, slot)) = small::place(&host.device, &host_desc, initial) {
+            name(&texture, true);
+            return Some((texture, Some(slot)));
+        }
+    }
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
@@ -1683,9 +2099,7 @@ fn host_texture(
             &heap,
             D3D12_HEAP_FLAG_NONE,
             (&raw const d).cast(),
-            D3D12_RESOURCE_STATES(
-                crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
-            ),
+            initial,
             // The same layout: format, then color or depth and stencil.
             clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
             &mut texture,
@@ -1695,11 +2109,9 @@ fn host_texture(
         tracing::warn!(error = %e, desc = ?d, "no host texture");
     }
     if let Some(t) = &texture {
-        crate::host::name(t, || {
-            format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
-        });
+        name(t, false);
     }
-    texture
+    texture.map(|t| (t, None))
 }
 
 /// A texture's console memory and description; `None` for buffers.
