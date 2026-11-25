@@ -1719,6 +1719,26 @@ mod barycentric_tests {
         validate(&shader);
     }
 
+    /// `v_fma_mixlo_f16` keeps the high half of its destination; one we have no value for
+    /// reads as 0, as with the other 16-bit writes, so the low half it wrote stays usable.
+    /// (`PS_DeferredTextured` reuses the register of an f16 interpolation's first half
+    /// that way: `38bf0814e721a1b3`, `78f3f2fc53a69531`.)
+    #[test]
+    fn a_mixlo_result_over_a_register_without_a_value() {
+        let [e0, e1] = exp_mrt0(2);
+        let words = [
+            0x7E08_0200, // v_mov_b32 v4, s0 (a hardware SGPR: no value)
+            0xCC21_0004, // v_fma_mixlo_f16 v4, 1.0, 1.0, 0
+            0x0201_E4F2,
+            0x7E04_1704, // v_cvt_f32_f16 v2, v4
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        let shader = pixel(&words, PERSP_CENTER).unwrap();
+        validate(&shader);
+    }
+
     /// P10 of an attribute the program interpolates is P1 - P0.
     #[test]
     fn p10_of_an_interpolated_attribute() {
